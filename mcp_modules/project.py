@@ -1,14 +1,3 @@
-"""
-Project Management Module
-
-Provides tools for:
-- Temporary project creation and management
-- Foundry project initialization
-- Smart contract file management
-- Project isolation and cleanup
-- Integration with build and deploy modules
-"""
-
 import subprocess
 import json
 import os
@@ -229,7 +218,6 @@ class ProjectManager:
         """Determine if a file is a test file"""
         filename_lower = filename.lower()
         
-        # Check filename patterns
         test_patterns = [
             '.t.sol',  # Foundry test pattern
             'test_',   # Test prefix
@@ -262,7 +250,13 @@ class ProjectManager:
         return False
 
     def add_files(self, project_id: str, files: Dict[str, str]) -> Dict[str, Any]:
-        """Add multiple files to project (contracts, tests, scripts, configs, etc.)"""
+        """Add multiple files to project (contracts, tests, scripts, configs, etc.)
+        
+        Args:
+            project_id: Project identifier
+            files: Dictionary where keys are file paths (can include subdirectories) 
+                   and values are file contents
+        """
         if project_id not in self.projects:
             return {"success": False, "error": f"Project {project_id} not found"}
         
@@ -272,44 +266,58 @@ class ProjectManager:
         added_files = []
         errors = []
         
-        for filename, content in files.items():
+        for file_path_str, content in files.items():
             try:
-                filename_only = Path(filename).name
+                file_path_obj = Path(file_path_str)
                 
-                if self._is_test_file(filename, content):
-                    target_dir = project_path / "test"
-                elif filename.endswith('.sol'):
-                    target_dir = project_path / "src"
-                elif filename.endswith('.s.sol'):
-                    target_dir = project_path / "script"
-                elif filename.endswith('.t.sol'):
-                    target_dir = project_path / "test"
-                elif filename == 'foundry.toml':
+                if file_path_obj.parts[0] in ['test', 'tests']:
+                    target_dir = project_path / file_path_obj.parent
+                elif file_path_obj.parts[0] in ['script', 'scripts']:
+                    target_dir = project_path / file_path_obj.parent
+                elif file_path_obj.parts[0] in ['src', 'source']:
+                    target_dir = project_path / file_path_obj.parent
+                elif file_path_obj.name == 'foundry.toml':
                     target_dir = project_path
-                else:
+                elif self._is_test_file(file_path_str, content):
+                    target_dir = project_path / "test"
+                elif file_path_str.endswith('.sol'):
                     target_dir = project_path / "src"
+                elif file_path_str.endswith('.s.sol'):
+                    target_dir = project_path / "script"
+                elif file_path_str.endswith('.t.sol'):
+                    target_dir = project_path / "test"
+                else:
+                    target_dir = project_path 
+                    
                 
                 target_dir.mkdir(exist_ok=True, parents=True)
-                file_path = target_dir / filename_only
                 
-                with open(file_path, 'w', encoding='utf-8') as f:
+                if len(file_path_obj.parts) > 1 and file_path_obj.parts[0] not in ['test', 'tests', 'script', 'scripts', 'src', 'source']:
+                    full_target_dir = project_path / file_path_obj.parent
+                    full_target_dir.mkdir(exist_ok=True, parents=True)
+                    final_file_path = full_target_dir / file_path_obj.name
+                else:
+                    final_file_path = target_dir / file_path_obj.name
+                
+                with open(final_file_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 
                 file_info = {
-                    "filename": filename_only,
+                    "filename": file_path_obj.name,
                     "content": content,
-                    "path": str(file_path.relative_to(project_path)),
+                    "path": str(final_file_path.relative_to(project_path)),
+                    "original_path": file_path_str,
                     "size": len(content.encode('utf-8')),
                     "created_at": time.time()
                 }
                 
                 added_files.append(file_info)
                 
-                file_type = "test" if self._is_test_file(filename, content) else "file"
-                logger.info(f"Added {file_type} {filename_only} to project {project_id}")
+                file_type = "test" if self._is_test_file(file_path_str, content) else "file"
+                logger.info(f"Added {file_type} {file_path_obj.name} to project {project_id} at {final_file_path.relative_to(project_path)}")
                 
             except Exception as e:
-                error_msg = f"Failed to add {filename}: {str(e)}"
+                error_msg = f"Failed to add {file_path_str}: {str(e)}"
                 errors.append(error_msg)
                 logger.error(error_msg)
         
@@ -425,14 +433,12 @@ class ProjectManager:
             contract_name = artifact.get('name', 'Unknown')
             abi = artifact.get('abi', [])
             
-            # Extract constructor information
             constructor_params = []
             for item in abi:
                 if item.get('type') == 'constructor':
                     constructor_params = item.get('inputs', [])
                     break
             
-            # Extract functions for potential initialization
             functions = []
             for item in abi:
                 if item.get('type') == 'function':
@@ -464,7 +470,6 @@ class ProjectManager:
             
         except Exception as e:
             logger.error(f"Error generating deployment script with LLM: {e}")
-            # Fallback to basic template
             return self._create_basic_deployment_template(solc_version)
     
     def _create_deployment_prompt(self, contract_info: Dict[str, Any], 
@@ -506,7 +511,6 @@ class ProjectManager:
             import {{Script, console}} from "forge-std/Script.sol";
         """
         
-        # Add contract imports
         for contract_name in contract_info.keys():
             script_content += f'import {{{contract_name}}} from "../src/{contract_name}.sol";\n'
         
@@ -520,12 +524,10 @@ class ProjectManager:
                 console.log("Starting deployment...");
         """
         
-        # Generate deployment code for each contract
         for contract_name, info in contract_info.items():
             constructor_params = info['constructor_params']
             
             if constructor_params:
-                # Contract with constructor parameters
                 param_names = [param['name'] for param in constructor_params]
                 param_types = [param['type'] for param in constructor_params]
                 
@@ -534,7 +536,6 @@ class ProjectManager:
                     console.log("Deploying {contract_name}...");
                     {contract_name} {contract_name.lower()} = new {contract_name}("""
                             
-                # Add constructor parameters with default values
                 for i, (name, param_type) in enumerate(zip(param_names, param_types)):
                     default_value = self._get_default_value_for_type(param_type)
                     if i > 0:
@@ -545,7 +546,6 @@ class ProjectManager:
                     console.log("{contract_name} deployed at:", address({contract_name.lower()}));
                 """
             else:
-                # Contract without constructor parameters
                 script_content += f"""
                     // Deploy {contract_name}
                     console.log("Deploying {contract_name}...");
@@ -586,15 +586,12 @@ class ProjectManager:
             'bytes1': 'bytes1(0)'
         }
         
-        # Handle arrays
         if '[]' in param_type:
             return '[]'
         
-        # Handle mappings
         if 'mapping' in param_type:
             return 'mapping()'
         
-        # Return default value or type-specific default
         return type_mapping.get(param_type, '0')
     
     def _create_basic_deployment_template(self, solc_version: str = "0.8.19") -> str:
@@ -908,13 +905,164 @@ class ProjectManager:
             "results": results
         }
     
+    def get_file_content(self, project_id: str, file_path: str) -> Dict[str, Any]:
+        """Get content of any file from project directory
+        
+        Args:
+            project_id: Project identifier
+            file_path: Path to file relative to project root (e.g., "src/Contract.sol", "test/Test.t.sol")
+        """
+        if project_id not in self.projects:
+            return {"success": False, "error": f"Project {project_id} not found"}
+        
+        project = self.projects[project_id]
+        project_path = Path(project.project_path)
+        
+        try:
+            full_file_path = project_path / file_path
+            
+            try:
+                full_file_path.resolve().relative_to(project_path.resolve())
+            except ValueError:
+                return {
+                    "success": False, 
+                    "error": "File path is outside project directory"
+                }
+            
+            if not full_file_path.exists():
+                return {
+                    "success": False,
+                    "error": f"File not found: {file_path}"
+                }
+            
+            if not full_file_path.is_file():
+                return {
+                    "success": False,
+                    "error": f"Path is not a file: {file_path}"
+                }
+            
+            try:
+                content = full_file_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                return {
+                    "success": False,
+                    "error": f"File encoding error: {file_path}"
+                }
+            
+            stat = full_file_path.stat()
+            
+            return {
+                "success": True,
+                "file_path": file_path,
+                "absolute_path": str(full_file_path),
+                "content": content,
+                "metadata": {
+                    "size_bytes": stat.st_size,
+                    "created_at": stat.st_ctime,
+                    "modified_at": stat.st_mtime,
+                    "is_readable": True
+                },
+                "project_id": project_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Error reading file {file_path} from project {project_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    def list_project_files(self, project_id: str, directory: str = None, file_pattern: str = None) -> Dict[str, Any]:
+        """List files in project directory
+        
+        Args:
+            project_id: Project identifier
+            directory: Subdirectory to list (e.g., "src", "test", "script"). If None, lists root directory
+            file_pattern: File pattern to filter (e.g., "*.sol", "*.t.sol"). If None, lists all files
+        """
+        if project_id not in self.projects:
+            return {"success": False, "error": f"Project {project_id} not found"}
+        
+        project = self.projects[project_id]
+        project_path = Path(project.project_path)
+        
+        try:
+            if directory:
+                target_dir = project_path / directory
+            else:
+                target_dir = project_path
+            
+            try:
+                target_dir.resolve().relative_to(project_path.resolve())
+            except ValueError:
+                return {
+                    "success": False,
+                    "error": "Directory path is outside project directory"
+                }
+            
+            if not target_dir.exists():
+                return {
+                    "success": False,
+                    "error": f"Directory not found: {directory or 'root'}"
+                }
+            
+            if not target_dir.is_dir():
+                return {
+                    "success": False,
+                    "error": f"Path is not a directory: {directory or 'root'}"
+                }
+            
+            files = []
+            directories = []
+            
+            for item in target_dir.iterdir():
+                relative_path = item.relative_to(project_path)
+                
+                if item.is_file():
+                    if file_pattern and not item.match(file_pattern):
+                        continue
+                    
+                    stat = item.stat()
+                    files.append({
+                        "name": item.name,
+                        "path": str(relative_path),
+                        "size_bytes": stat.st_size,
+                        "modified_at": stat.st_mtime,
+                        "extension": item.suffix,
+                        "is_file": True
+                    })
+                
+                elif item.is_dir():
+                    directories.append({
+                        "name": item.name,
+                        "path": str(relative_path),
+                        "is_file": False
+                    })
+            
+            return {
+                "success": True,
+                "directory": directory or "root",
+                "project_id": project_id,
+                "files": sorted(files, key=lambda x: x["name"]),
+                "directories": sorted(directories, key=lambda x: x["name"]),
+                "total_files": len(files),
+                "total_directories": len(directories),
+                "file_pattern": file_pattern
+            }
+            
+        except Exception as e:
+            logger.error(f"Error listing files in project {project_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
 def generate_deployment_script(project_id: str, deployment_requirements: str = None) -> Dict[str, Any]:
     """Generate deployment script for project based on artifacts"""
     if project_id not in _project_manager.projects:
         return {"success": False, "error": f"Project {project_id} not found"}
     
     try:
-        # Compile project to get artifacts
         compile_result = _project_manager.compile_project(project_id)
         if not compile_result.get("success", False):
             return {"success": False, "error": "Project compilation failed"}
@@ -923,7 +1071,6 @@ def generate_deployment_script(project_id: str, deployment_requirements: str = N
         if not artifacts:
             return {"success": False, "error": "No artifacts found for script generation"}
         
-        # Generate script
         project = _project_manager.projects[project_id]
         project_path = Path(project.project_path)
         
@@ -959,8 +1106,18 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
             if old_text and new_text is not None:
                 modified_content = modified_content.replace(old_text, new_text)
         
+        elif modification_type == "find" and "replace" in modifications:
+            find_text = modification_data
+            replace_text = modifications.get("replace")
+            all_occurrences = modifications.get("all_occurrences", False)
+            
+            if find_text and replace_text is not None:
+                if all_occurrences:
+                    modified_content = modified_content.replace(find_text, replace_text)
+                else:
+                    modified_content = modified_content.replace(find_text, replace_text, 1)
+        
         elif modification_type == "replace_line":
-            # Replace specific line
             line_number = modification_data.get("line_number")
             new_line = modification_data.get("new_line")
             if line_number is not None and new_line is not None:
@@ -970,7 +1127,6 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                     modified_content = '\n'.join(lines)
         
         elif modification_type == "insert_line":
-            # Insert line at specific position
             line_number = modification_data.get("line_number")
             new_line = modification_data.get("new_line")
             if line_number is not None and new_line is not None:
@@ -979,7 +1135,6 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                 modified_content = '\n'.join(lines)
         
         elif modification_type == "delete_line":
-            # Delete specific line
             line_number = modification_data.get("line_number")
             if line_number is not None:
                 lines = modified_content.split('\n')
@@ -988,7 +1143,6 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                     modified_content = '\n'.join(lines)
         
         elif modification_type == "replace_regex":
-            # Replace using regex pattern
             pattern = modification_data.get("pattern")
             replacement = modification_data.get("replacement")
             if pattern and replacement is not None:
@@ -996,7 +1150,6 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                 modified_content = re.sub(pattern, replacement, modified_content)
         
         elif modification_type == "replace_between_markers":
-            # Replace content between markers
             start_marker = modification_data.get("start_marker")
             end_marker = modification_data.get("end_marker")
             new_content = modification_data.get("new_content")
@@ -1011,10 +1164,8 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                     )
         
         elif modification_type == "add_import":
-            # Add import statement
             import_statement = modification_data.get("import_statement")
             if import_statement:
-                # Find the last import statement and add after it
                 lines = modified_content.split('\n')
                 last_import_index = -1
                 for i, line in enumerate(lines):
@@ -1025,7 +1176,6 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                     lines.insert(last_import_index + 1, import_statement)
                     modified_content = '\n'.join(lines)
                 else:
-                    # No imports found, add at the beginning after pragma
                     pragma_index = -1
                     for i, line in enumerate(lines):
                         if line.strip().startswith('pragma '):
@@ -1034,16 +1184,13 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                     
                     if pragma_index >= 0:
                         lines.insert(pragma_index + 1, import_statement)
-                        lines.insert(pragma_index + 2, "")  # Add empty line
+                        lines.insert(pragma_index + 2, "")  
                         modified_content = '\n'.join(lines)
         
         elif modification_type == "add_function":
-            # Add new function
             function_code = modification_data.get("function_code")
             if function_code:
-                # Add function before the closing brace
                 lines = modified_content.split('\n')
-                # Find the last closing brace
                 for i in range(len(lines) - 1, -1, -1):
                     if lines[i].strip() == '}':
                         lines.insert(i, function_code)
@@ -1051,12 +1198,10 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
                 modified_content = '\n'.join(lines)
         
         elif modification_type == "replace_function":
-            # Replace entire function
             function_name = modification_data.get("function_name")
             new_function_code = modification_data.get("new_function_code")
             if function_name and new_function_code:
                 import re
-                # Pattern to match function definition and body
                 pattern = rf'function\s+{function_name}\s*\([^)]*\)\s*[^{{]*\{{[^}}]*\}}'
                 modified_content = re.sub(pattern, new_function_code, modified_content, flags=re.DOTALL)
     
@@ -1065,34 +1210,77 @@ def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str
 
 def analyze_contract_artifacts(project_id: str) -> Dict[str, Any]:
     """Analyze contract artifacts for deployment information"""
-    if project_id not in _project_manager.projects:
-        return {"success": False, "error": f"Project {project_id} not found"}
-    
     try:
-        compile_result = _project_manager.compile_project(project_id)
-        if not compile_result.get("success", False):
-            return {"success": False, "error": "Project compilation failed"}
+        project_manager = get_project_manager()
+        project = project_manager.get_project(project_id)
         
-        artifacts = compile_result.get("artifacts", [])
+        if not project:
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found"
+            }
+        
+        artifacts = project.get_artifacts()
+        
         if not artifacts:
-            return {"success": False, "error": "No artifacts found"}
+            return {
+                "success": False,
+                "error": "No artifacts found in project"
+            }
         
-        contract_info = _project_manager._analyze_artifacts_for_deployment(artifacts)
+        contract_info = {}
+        total_contracts = 0
+        
+        for artifact in artifacts:
+            contract_name = artifact.get('name', 'Unknown')
+            abi = artifact.get('abi', [])
+            
+            constructor_params = []
+            for item in abi:
+                if item.get('type') == 'constructor':
+                    constructor_params = item.get('inputs', [])
+                    break
+            
+            functions = []
+            for item in abi:
+                if item.get('type') == 'function':
+                    functions.append({
+                        'name': item.get('name', ''),
+                        'inputs': item.get('inputs', []),
+                        'stateMutability': item.get('stateMutability', 'nonpayable')
+                    })
+            
+            contract_info[contract_name] = {
+                'constructor_params': constructor_params,
+                'functions': functions,
+                'abi': abi,
+                'bytecode': artifact.get('bytecode', ''),
+                'path': artifact.get('path', ''),
+                'has_constructor': len(constructor_params) > 0,
+                'function_count': len(functions)
+            }
+            total_contracts += 1
+        
+        analysis_summary = {
+            'total_contracts': total_contracts,
+            'contracts_with_constructors': sum(1 for info in contract_info.values() if info['has_constructor']),
+            'total_functions': sum(info['function_count'] for info in contract_info.values()),
+            'contract_names': list(contract_info.keys())
+        }
         
         return {
             "success": True,
             "contracts": contract_info,
-            "total_contracts": len(contract_info),
-            "analysis_summary": {
-                "contracts_with_constructors": len([c for c in contract_info.values() if c['constructor_params']]),
-                "contracts_without_constructors": len([c for c in contract_info.values() if not c['constructor_params']]),
-                "total_functions": sum(len(c['functions']) for c in contract_info.values())
-            }
+            "total_contracts": total_contracts,
+            "analysis_summary": analysis_summary
         }
         
     except Exception as e:
         logger.error(f"Error analyzing contract artifacts: {e}")
-        return {"success": False, "error": str(e)}
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 _project_manager = ProjectManager()
