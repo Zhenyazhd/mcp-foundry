@@ -350,7 +350,17 @@ class TestRunner:
         try:
             start_time = time.time()
             cmd = ["forge", "coverage", "--report", "lcov"]
-            cmd.extend(["-vv" if config.verbosity == 2 else f"-v" * config.verbosity])
+            
+            if config.verbosity == 2:
+                cmd.append("-vv")
+            elif config.verbosity == 3:
+                cmd.append("-vvv")
+            elif config.verbosity == 4:
+                cmd.append("-vvvv")
+            elif config.verbosity == 5:
+                cmd.append("-vvvvv")
+            elif config.verbosity > 0:
+                cmd.append(f"-v{'v' * (config.verbosity - 1)}")
             
             logger.info(f"Running coverage analysis with command: {' '.join(cmd)}")
             

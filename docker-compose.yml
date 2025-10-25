@@ -1,0 +1,33 @@
+services:
+  mcp-foundry-anvil:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mcp-foundry-anvil-server
+    ports:
+      - "8000:8000"
+    volumes:
+      - foundry_projects:/tmp/foundry_projects
+      - build_cache:/tmp/build_cache
+      - deploy_cache:/tmp/deploy_cache
+      - ./mcp_modules:/app/mcp_modules:ro
+    environment:
+      - PYTHONPATH=/app
+      - FOUNDRY_CACHE_DIR=/tmp/foundry_projects
+      - BUILD_CACHE_DIR=/tmp/build_cache
+      - DEPLOY_CACHE_DIR=/tmp/deploy_cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import mcp_modules; print('MCP Foundry Anvil loaded successfully')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  foundry_projects:
+    driver: local
+  build_cache:
+    driver: local
+  deploy_cache:
+    driver: local

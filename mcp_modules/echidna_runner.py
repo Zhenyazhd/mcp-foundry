@@ -1,9 +1,3 @@
-"""
-Echidna Test Runner Module
-
-Модуль для запуска и анализа результатов Echidna fuzz тестов.
-Поддерживает создание конфигурации Echidna, запуск тестов и парсинг результатов.
-"""
 
 import subprocess
 import time
@@ -59,7 +53,7 @@ class EchidnaConfig:
         self.corpus_dir = corpus_dir
         self.coverage = coverage
         self.shrink_timeout = shrink_timeout
-        self.test_mode = test_mode  # "property" or "assertion"
+        self.test_mode = test_mode 
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -107,7 +101,6 @@ class EchidnaRunner:
     def _check_echidna_installed(self) -> bool:
         """Check if Echidna is installed via pip3"""
         try:
-            # First check if echidna is available in PATH
             result = subprocess.run(
                 ["echidna", "--version"],
                 capture_output=True,
@@ -117,7 +110,6 @@ class EchidnaRunner:
             if result.returncode == 0:
                 return True
             
-            # If not in PATH, check if it's installed via pip3
             result = subprocess.run(
                 ["python3", "-c", "import echidna; print('Echidna available')"],
                 capture_output=True,
@@ -139,7 +131,7 @@ class EchidnaRunner:
             "seqLen": config.seq_len,
             "contractAddr": config.contract_addr,
             "sender": config.sender,
-            "psender": str(config.psender),  # Convert to string as Echidna expects
+            "psender": str(config.psender),  
             "callGasLimit": config.call_gas_limit,
             "codeSize": config.code_size,
             "format": config.format,
@@ -147,7 +139,6 @@ class EchidnaRunner:
             "shrinkTimeout": config.shrink_timeout
         }
         
-        # Add optional parameters
         if config.contract:
             config_data["contract"] = config.contract
         if config.corpus_dir:
@@ -164,9 +155,7 @@ class EchidnaRunner:
         """Build echidna test command"""
         cmd = ["echidna"]
         
-        # Add contract file
         if config.contract:
-            # Look for the specific contract in EchidnaTest files
             contract_files = []
             contract_files.extend(list(self.project_path.glob(f"src/**/{config.contract}.sol")))
             contract_files.extend(list(self.project_path.glob(f"contracts/**/{config.contract}.sol")))
@@ -180,36 +169,22 @@ class EchidnaRunner:
             else:
                 raise FileNotFoundError(f"Contract {config.contract} not found in project directory")
         else:
-            # Find Echidna test files (*EchidnaTest.sol) in common directories
-            echidna_test_files = []
-            
-            # Check src directory and subdirectories for EchidnaTest files
-            echidna_test_files.extend(list(self.project_path.glob("src/**/*EchidnaTest.sol")))
-            
-            # Check contracts directory and subdirectories for EchidnaTest files
+            echidna_test_files = []            
+            echidna_test_files.extend(list(self.project_path.glob("src/**/*EchidnaTest.sol")))            
             echidna_test_files.extend(list(self.project_path.glob("contracts/**/*EchidnaTest.sol")))
-            
-            # Check test directory for EchidnaTest files
             echidna_test_files.extend(list(self.project_path.glob("test/**/*EchidnaTest.sol")))
-            
-            # Check root directory for EchidnaTest files
             echidna_test_files.extend(list(self.project_path.glob("*EchidnaTest.sol")))
-            
-            # Check any subdirectory for EchidnaTest files
             echidna_test_files.extend(list(self.project_path.glob("**/*EchidnaTest.sol")))
             
             if echidna_test_files:
-                # Use the first found Echidna test file
                 cmd.append(str(echidna_test_files[0]))
                 logger.info(f"Using Echidna test file: {echidna_test_files[0]}")
             else:
                 raise FileNotFoundError("No EchidnaTest.sol files found in project directory")
         
-        # Add configuration file
         config_path = self._create_echidna_config(config)
         cmd.extend(["--config", str(config_path)])
         
-        # Add command line options
         cmd.extend(["--test-limit", str(config.runs)])
         cmd.extend(["--timeout", str(config.timeout)])
         
@@ -228,7 +203,6 @@ class EchidnaRunner:
         
         lines = output.splitlines()
         
-        # Parse test results
         total_tests = 0
         passed_tests = 0
         failed_tests = 0
@@ -236,8 +210,6 @@ class EchidnaRunner:
         
         for line in lines:
             line = line.strip()
-            
-            # Parse coverage information
             if "coverage:" in line.lower():
                 try:
                     coverage_str = line.split("coverage:")[-1].strip().replace("%", "")
@@ -245,11 +217,9 @@ class EchidnaRunner:
                 except (ValueError, IndexError):
                     pass
             
-            # Parse fuzzing statistics
             if "fuzzing:" in line.lower():
                 try:
                     stats_part = line.split("fuzzing:")[-1].strip()
-                    # Extract numbers from stats
                     import re
                     numbers = re.findall(r'\d+', stats_part)
                     if len(numbers) >= 2:
@@ -258,7 +228,6 @@ class EchidnaRunner:
                 except (ValueError, IndexError):
                     pass
             
-            # Parse test failures
             if "failed:" in line.lower():
                 try:
                     failed_str = line.split("failed:")[-1].strip()
@@ -266,7 +235,6 @@ class EchidnaRunner:
                 except (ValueError, IndexError):
                     pass
             
-            # Parse property violations
             if "property" in line.lower() and "violated" in line.lower():
                 findings.append({
                     "type": "property_violation",
@@ -275,7 +243,6 @@ class EchidnaRunner:
                 })
                 failed_tests += 1
         
-        # Parse error output for additional findings
         error_lines = error_output.splitlines()
         for line in error_lines:
             line = line.strip()
@@ -288,7 +255,7 @@ class EchidnaRunner:
         
         total_tests = max(total_tests, passed_tests + failed_tests)
         if total_tests == 0:
-            total_tests = 1  # Default to 1 if no tests found
+            total_tests = 1  
         
         return {
             "total_tests": total_tests,
@@ -303,7 +270,6 @@ class EchidnaRunner:
         """Run Echidna tests with given configuration"""
         start_time = time.time()
         
-        # Check if Echidna is installed
         if not self._check_echidna_installed():
             return EchidnaResult(
                 success=False,
@@ -325,25 +291,18 @@ class EchidnaRunner:
             )
         
         try:
-            # Build command
             cmd = self._build_echidna_command(config)
-            
             logger.info(f"Running Echidna command: {' '.join(cmd)}")
-            
-            # Run tests
             result = subprocess.run(
                 cmd,
                 cwd=self.project_path,
                 capture_output=True,
                 text=True,
-                timeout=config.timeout + 30  # Add buffer to timeout
+                timeout=config.timeout + 30  
             )
             
             execution_time = time.time() - start_time
-            
-            # Parse output
             parsed_results = self._parse_echidna_output(result.stdout, result.stderr)
-            
             success = result.returncode == 0 and parsed_results["failed_tests"] == 0
             
             return EchidnaResult(
@@ -353,7 +312,7 @@ class EchidnaRunner:
                 failed_tests=parsed_results["failed_tests"],
                 coverage_percentage=parsed_results["coverage_percentage"],
                 execution_time=execution_time,
-                gas_used=0,  # Echidna doesn't provide detailed gas info
+                gas_used=0,  
                 fuzzing_stats=parsed_results["fuzzing_stats"],
                 findings=parsed_results["findings"],
                 output=result.stdout,
@@ -462,18 +421,15 @@ contract {contract_name}EchidnaTest is Test {{
         try:
             logger.info("Attempting to install Echidna via pip3...")
             
-            # First try pip3 installation
             pip3_result = self._install_echidna_pip3()
             if pip3_result["success"]:
                 return pip3_result
             
-            # If pip3 fails, try pip
             logger.info("pip3 failed, trying pip...")
             pip_result = self._install_echidna_pip()
             if pip_result["success"]:
                 return pip_result
             
-            # If both pip methods fail, fall back to platform-specific installation
             logger.info("pip installation failed, falling back to platform-specific methods...")
             return self._install_echidna_platform_specific(platform)
                 
@@ -490,8 +446,6 @@ contract {contract_name}EchidnaTest is Test {{
         """Install Echidna using pip3"""
         try:
             logger.info("Installing Echidna and dependencies via pip3...")
-            
-            # Install slither-analyzer (includes echidna)
             result = subprocess.run(
                 ["pip3", "install", "slither-analyzer"],
                 capture_output=True,
@@ -507,7 +461,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please check pip3 installation and try manual installation"
                 }
             
-            # Install crytic-compile (required dependency)
             logger.info("Installing crytic-compile...")
             result2 = subprocess.run(
                 ["pip3", "install", "crytic-compile"],
@@ -518,10 +471,8 @@ contract {contract_name}EchidnaTest is Test {{
             
             if result2.returncode != 0:
                 logger.warning(f"Failed to install crytic-compile: {result2.stderr}")
-                # Continue anyway, as slither-analyzer might work without it
             
             if result.returncode == 0:
-                # Verify installation
                 if self._check_echidna_installed():
                     return {
                         "success": True,
@@ -563,7 +514,6 @@ contract {contract_name}EchidnaTest is Test {{
         try:
             logger.info("Installing Echidna and dependencies via pip...")
             
-            # Install slither-analyzer (includes echidna)
             result = subprocess.run(
                 ["pip", "install", "slither-analyzer"],
                 capture_output=True,
@@ -579,7 +529,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please check pip installation and try manual installation"
                 }
             
-            # Install crytic-compile (required dependency)
             logger.info("Installing crytic-compile...")
             result2 = subprocess.run(
                 ["pip", "install", "crytic-compile"],
@@ -590,10 +539,8 @@ contract {contract_name}EchidnaTest is Test {{
             
             if result2.returncode != 0:
                 logger.warning(f"Failed to install crytic-compile: {result2.stderr}")
-                # Continue anyway, as slither-analyzer might work without it
             
             if result.returncode == 0:
-                # Verify installation
                 if self._check_echidna_installed():
                     return {
                         "success": True,
@@ -635,11 +582,9 @@ contract {contract_name}EchidnaTest is Test {{
         import platform as platform_module
         
         try:
-            # Detect platform if not specified
             if not platform:
                 system = platform_module.system().lower()
                 if system == "linux":
-                    # Try to detect Linux distribution
                     try:
                         with open("/etc/os-release", "r") as f:
                             os_release = f.read().lower()
@@ -648,9 +593,9 @@ contract {contract_name}EchidnaTest is Test {{
                             elif "fedora" in os_release or "rhel" in os_release or "centos" in os_release:
                                 platform = "fedora"
                             else:
-                                platform = "ubuntu_debian"  # Default to apt
+                                platform = "ubuntu_debian"  
                     except:
-                        platform = "ubuntu_debian"  # Default to apt
+                        platform = "ubuntu_debian"  
                 elif system == "darwin":
                     platform = "macos"
                 elif system == "windows":
@@ -689,7 +634,6 @@ contract {contract_name}EchidnaTest is Test {{
     def _install_echidna_apt(self) -> Dict[str, Any]:
         """Install Echidna using apt (Ubuntu/Debian)"""
         try:
-            # Update package list
             logger.info("Updating package list...")
             result = subprocess.run(
                 ["sudo", "apt-get", "update"],
@@ -706,7 +650,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please run 'sudo apt-get update' manually and try again"
                 }
             
-            # Install Echidna
             logger.info("Installing Echidna...")
             result = subprocess.run(
                 ["sudo", "apt-get", "install", "-y", "echidna"],
@@ -716,7 +659,6 @@ contract {contract_name}EchidnaTest is Test {{
             )
             
             if result.returncode == 0:
-                # Verify installation
                 if self._check_echidna_installed():
                     return {
                         "success": True,
@@ -755,7 +697,6 @@ contract {contract_name}EchidnaTest is Test {{
     def _install_echidna_brew(self) -> Dict[str, Any]:
         """Install Echidna using Homebrew (macOS)"""
         try:
-            # Check if brew is available
             brew_check = subprocess.run(
                 ["which", "brew"],
                 capture_output=True,
@@ -769,7 +710,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please install Homebrew first: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
                 }
             
-            # Install Echidna
             logger.info("Installing Echidna via Homebrew...")
             result = subprocess.run(
                 ["brew", "install", "echidna"],
@@ -779,7 +719,6 @@ contract {contract_name}EchidnaTest is Test {{
             )
             
             if result.returncode == 0:
-                # Verify installation
                 if self._check_echidna_installed():
                     return {
                         "success": True,
@@ -828,7 +767,6 @@ contract {contract_name}EchidnaTest is Test {{
             )
             
             if result.returncode == 0:
-                # Verify installation
                 if self._check_echidna_installed():
                     return {
                         "success": True,
@@ -867,7 +805,6 @@ contract {contract_name}EchidnaTest is Test {{
     def _install_echidna_docker(self) -> Dict[str, Any]:
         """Install Echidna using Docker"""
         try:
-            # Check if docker is available
             docker_check = subprocess.run(
                 ["which", "docker"],
                 capture_output=True,
@@ -881,7 +818,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please install Docker first"
                 }
             
-            # Pull Echidna Docker image
             logger.info("Pulling Echidna Docker image...")
             result = subprocess.run(
                 ["docker", "pull", "ghcr.io/crytic/echidna/echidna:latest"],
@@ -941,7 +877,6 @@ contract {contract_name}EchidnaTest is Test {{
             
             logger.info(f"Installing Echidna locally in project: {project_path}")
             
-            # Try pip3 first
             pip3_result = self._install_echidna_pip3()
             if pip3_result["success"]:
                 return {
@@ -954,7 +889,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "verification": pip3_result.get("verification", "Echidna is now available")
                 }
             
-            # If pip3 fails, try pip
             pip_result = self._install_echidna_pip()
             if pip_result["success"]:
                 return {
@@ -967,7 +901,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "verification": pip_result.get("verification", "Echidna is now available")
                 }
             
-            # If both pip methods fail, fall back to Docker
             logger.info("pip installation failed, falling back to Docker...")
             return self.install_echidna_docker_locally(project_path)
                 
@@ -985,7 +918,6 @@ contract {contract_name}EchidnaTest is Test {{
         try:
             import requests
             
-            # Get latest release info
             response = requests.get(
                 "https://api.github.com/repos/crytic/echidna/releases/latest",
                 timeout=30
@@ -1001,7 +933,6 @@ contract {contract_name}EchidnaTest is Test {{
             release_data = response.json()
             tag_name = release_data["tag_name"]
             
-            # Find the appropriate asset for the platform
             assets = release_data.get("assets", [])
             
             return {
@@ -1021,15 +952,7 @@ contract {contract_name}EchidnaTest is Test {{
     def _download_echidna_binary(self, download_url: str, target_dir: Path, platform_info: str) -> Dict[str, Any]:
         """Download and extract Echidna binary"""
         try:
-            import requests
-            
-            # For now, we'll use a simplified approach
-            # In a real implementation, you'd parse the GitHub release assets
-            # and download the correct binary for the platform
-            
-            # This is a placeholder - you'd need to implement the actual download logic
-            # based on the GitHub release assets
-            
+            import requests        
             return {
                 "success": False,
                 "error": "Binary download not implemented yet",
@@ -1052,7 +975,6 @@ contract {contract_name}EchidnaTest is Test {{
             
             project_path = Path(project_path).resolve()
             
-            # Check if docker is available
             docker_check = subprocess.run(
                 ["which", "docker"],
                 capture_output=True,
@@ -1066,7 +988,6 @@ contract {contract_name}EchidnaTest is Test {{
                     "message": "Please install Docker first"
                 }
             
-            # Create docker-compose.yml for Echidna
             docker_compose_content = f'''version: '3.8'
 services:
   echidna:
@@ -1081,7 +1002,6 @@ services:
             with open(docker_compose_path, 'w') as f:
                 f.write(docker_compose_content)
             
-            # Create wrapper script
             wrapper_script = f'''#!/bin/bash
 # Echidna Docker wrapper script
 # Usage: ./echidna-docker.sh [echidna-arguments]
@@ -1099,7 +1019,6 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
             
             wrapper_path.chmod(0o755)
             
-            # Test the setup
             test_result = subprocess.run(
                 [str(wrapper_path), "--version"],
                 capture_output=True,
@@ -1137,18 +1056,13 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
     def run_tests_with_command(self, config: EchidnaConfig, echidna_command: str) -> EchidnaResult:
         """Run Echidna tests using a specific command (local binary or Docker wrapper)"""
         try:
-            # Create configuration file
             config_path = self._create_echidna_config(config)
             
-            # Build command
             cmd = [echidna_command]
             
-            # Add configuration file
             cmd.append(str(config_path))
             
-            # Add test file or contract
             if config.contract:
-                # If contract is specified, look for it in common locations recursively
                 contract_files = []
                 contract_files.extend(list(self.project_path.glob(f"src/**/{config.contract}.sol")))
                 contract_files.extend(list(self.project_path.glob(f"contracts/**/{config.contract}.sol")))
@@ -1174,7 +1088,6 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
                         error_output=f"Contract {config.contract} not found in project"
                     )
             else:
-                # Find Echidna test files (*EchidnaTest.sol) in the project
                 echidna_test_files = []
                 echidna_test_files.extend(list(self.project_path.glob("test/**/*EchidnaTest.sol")))
                 echidna_test_files.extend(list(self.project_path.glob("src/**/*EchidnaTest.sol")))
@@ -1200,7 +1113,6 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
                         error_output="No EchidnaTest.sol files found in project"
                     )
             
-            # Add additional options
             if config.runs:
                 cmd.extend(["--test-limit", str(config.runs)])
             if config.timeout:
@@ -1223,9 +1135,7 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
             )
             execution_time = time.time() - start_time
             
-            # Parse results
             if result.returncode == 0:
-                # Success - parse output for statistics
                 output_lines = result.stdout.split('\n')
                 total_tests = 0
                 passed_tests = 0
@@ -1233,7 +1143,6 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
                 coverage_percentage = 0.0
                 findings = []
                 
-                # Simple parsing of Echidna output
                 for line in output_lines:
                     if "test" in line.lower() and "passed" in line.lower():
                         passed_tests += 1
@@ -1254,7 +1163,7 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
                     failed_tests=failed_tests,
                     coverage_percentage=coverage_percentage,
                     execution_time=execution_time,
-                    gas_used=0,  # TODO: Parse gas usage from output
+                    gas_used=0, 
                     fuzzing_stats={
                         "runs": config.runs,
                         "timeout": config.timeout,
@@ -1266,11 +1175,9 @@ docker run --rm -v "$PROJECT_DIR:/src" -w /src "$DOCKER_IMAGE" "$@"
                     error_output=result.stderr
                 )
             else:
-                # Failure - parse error output
                 error_output = result.stderr or result.stdout
                 findings = []
                 
-                # Extract findings from error output
                 for line in error_output.split('\n'):
                     if "failed" in line.lower() or "error" in line.lower():
                         findings.append(line.strip())
