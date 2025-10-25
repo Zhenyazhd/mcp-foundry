@@ -1,4 +1,4 @@
-from mcp_modules.project import ProjectType, get_project_manager, apply_file_modifications
+from mcp_modules.project_secure import ProjectType, get_project_manager, apply_file_modifications, SecurityError
 from mcp_modules.tests_runner import TestRunner, TestConfig, TestResult
 from mcp_modules.scenario import ScenarioRunner, ScenarioParser, ScenarioHelper
 from mcp_modules.echidna_runner import EchidnaRunner, EchidnaConfig, EchidnaResult
@@ -131,6 +131,127 @@ def project_debug(project_id: str) -> Dict[str, Any]:
         }
 
 @mcp.tool()
+def project_get_path(project_id: str) -> Dict[str, Any]:
+    """Get the absolute path to a project directory"""
+    try:
+        project = project_manager.get_project(project_id)
+        
+        if not project:
+            all_projects = project_manager.list_projects()
+            available_ids = [p.project_id for p in all_projects]
+            
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found",
+                "available_project_ids": available_ids,
+                "total_projects": len(available_ids),
+                "message": f"Project {project_id} not found. Available projects: {available_ids}"
+            }
+        
+        project_path = Path(project.project_path)
+        directory_exists = project_path.exists()
+        
+        return {
+            "success": True,
+            "project_id": project_id,
+            "project_path": str(project_path.absolute()),
+            "project_path_resolved": str(project_path.resolve()),
+            "directory_exists": directory_exists,
+            "project_type": project.project_type.value,
+            "created_at": project.created_at,
+            "message": f"Project path retrieved successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting project path for {project_id}: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+            "project_id": project_id,
+            "message": "Failed to get project path"
+        }
+
+@mcp.tool()
+def project_write_file(
+    project_id: str,
+    file_path: str,
+    content: str
+) -> Dict[str, Any]:
+    """Write content to a file (create or overwrite) with security validation"""
+    try:
+        project = project_manager.get_project(project_id)
+        if not project:
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found"
+            }
+        
+        project_path = Path(project.project_path)
+        
+        # Security validation using SecurePathValidator
+        try:
+            from mcp_modules.project_secure import SecurePathValidator
+            validated_path = SecurePathValidator.validate_path(file_path, project_path)
+        except SecurityError as e:
+            return {
+                "success": False,
+                "error": f"Security validation failed: {e}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Path validation error: {e}"
+            }
+        
+        # Validate content
+        try:
+            if not SecurePathValidator.validate_file_content(content):
+                return {
+                    "success": False,
+                    "error": "Content validation failed"
+                }
+            if not SecurePathValidator.validate_file_size(content):
+                return {
+                    "success": False,
+                    "error": "Content too large"
+                }
+        except SecurityError as e:
+            return {
+                "success": False,
+                "error": f"Content validation failed: {e}"
+            }
+        
+        # Create parent directories if they don't exist
+        validated_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write content to file
+        try:
+            with open(validated_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Error writing file: {e}"
+            }
+        
+        logger.info(f"Wrote file {file_path} in project {project_id}")
+        
+        return {
+            "success": True,
+            "file_path": file_path,
+            "absolute_path": str(validated_path),
+            "file_size": len(content.encode('utf-8')),
+            "message": f"Successfully wrote {file_path}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error writing file: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@mcp.tool()
 def project_add_files(
     project_id: str,
     files: Dict[str, str]
@@ -177,20 +298,29 @@ def project_delete_file(
             }
         
         project_path = Path(project.project_path)
-        full_path = project_path / file_path
+        
+        # Security validation using SecurePathValidator
+        try:
+            from mcp_modules.project_secure import SecurePathValidator
+            validated_path = SecurePathValidator.validate_path(file_path, project_path)
+        except SecurityError as e:
+            return {
+                "success": False,
+                "error": f"Security validation failed: {e}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Path validation error: {e}"
+            }
+        
+        # Use validated path instead of full_path
+        full_path = validated_path
         
         if not full_path.exists():
             return {
                 "success": False,
                 "error": f"File {file_path} not found in project"
-            }
-        
-        try:
-            full_path.resolve().relative_to(project_path.resolve())
-        except ValueError:
-            return {
-                "success": False,
-                "error": "File path is outside project directory"
             }
         
         if full_path.is_dir():
@@ -250,13 +380,23 @@ def project_modify_file(
                 "error": f"Path {file_path} is a directory, not a file. Please specify the full file path."
             }
         
+        # Security validation using SecurePathValidator
         try:
-            full_path.resolve().relative_to(project_path.resolve())
-        except ValueError:
+            from mcp_modules.project_secure import SecurePathValidator
+            validated_path = SecurePathValidator.validate_path(file_path, project_path)
+        except SecurityError as e:
             return {
                 "success": False,
-                "error": "File path is outside project directory"
+                "error": f"Security validation failed: {e}"
             }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Path validation error: {e}"
+            }
+        
+        # Use validated path instead of full_path
+        full_path = validated_path
         
         try:
             with open(full_path, 'r', encoding='utf-8') as f:
@@ -267,7 +407,19 @@ def project_modify_file(
                 "error": f"Error reading file: {e}"
             }
         
-        modified_content = apply_file_modifications(current_content, modifications)
+        try:
+            modified_content = apply_file_modifications(current_content, modifications)
+        except SecurityError as e:
+            return {
+                "success": False,
+                "error": f"Security validation failed: {e}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Error applying modifications: {e}"
+            }
+        
         try:
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(modified_content)
@@ -350,7 +502,18 @@ def project_modify_files_by_pattern(
                 with open(file_path_obj, 'r', encoding='utf-8') as f:
                     current_content = f.read()
                 
-                modified_content = apply_file_modifications(current_content, modifications)
+                try:
+                    modified_content = apply_file_modifications(current_content, modifications)
+                except SecurityError as e:
+                    error_msg = f"Security validation failed for {file_path}: {e}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+                    continue
+                except Exception as e:
+                    error_msg = f"Error applying modifications to {file_path}: {e}"
+                    errors.append(error_msg)
+                    logger.error(error_msg)
+                    continue
                 
                 with open(file_path_obj, 'w', encoding='utf-8') as f:
                     f.write(modified_content)
