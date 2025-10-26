@@ -2,9 +2,10 @@
 
 Smart Contract Project Manager with MCP (Model Context Protocol) integration for Ethereum development.
 
-## ⚠️ Work in Progress
 
-**This project is currently under active development and is not yet ready for production use.** The codebase is being cleaned up, optimized, and prepared for GitHub. Some features may be incomplete or subject to change.
+## Deployed MCP
+
+https://steadfast-miracle-production.up.railway.app/mcp
 
 ## Current Status
 
@@ -16,6 +17,7 @@ Smart Contract Project Manager with MCP (Model Context Protocol) integration for
 - **File Operations**: Add, modify, and delete contract files
 - **Compilation**: Unified compilation using project settings (solc version, optimization)
 - **Testing**: Run tests, fuzz tests, coverage analysis, gas reports
+- **Fuzzing**: Echidna integration for property-based testing and vulnerability discovery
 - **Deployment**: Generate smart deployment scripts based on artifacts
 - **Dependencies**: Install external dependencies (OpenZeppelin, etc.)
 - **Scenario Testing**: YAML-based declarative testing framework
@@ -32,7 +34,11 @@ mcp-foundry-anvil/
 │   ├── scenario.py          # Scenario testing (1424 lines)
 │   └── chain.py             # Chain management (604 lines)
 ├── pyproject.toml           # Dependencies
-└── requirements.txt         # Python requirements
+├── requirements.txt         # Python requirements
+├── Dockerfile               # Docker container definition
+├── docker-compose.yml       # Docker Compose configuration
+├── .dockerignore            # Docker ignore file
+└── README.md                # This file
 ```
 
 ### Key Features
@@ -69,6 +75,8 @@ mcp-foundry-anvil/
 
 ## Quick Start
 
+### Option 1: Local Installation
+
 ```bash
 # Install dependencies
 pip install -r requirements.txt
@@ -77,11 +85,69 @@ pip install -r requirements.txt
 python server.py
 ```
 
+### Option 2: Docker Installation
+
+```bash
+# Build and run with Docker Compose
+docker-compose up --build
+
+# Run in detached mode
+docker-compose up -d --build
+
+# View logs
+docker-compose logs -f
+
+# Stop the container
+docker-compose down
+```
+
+### Option 3: Direct Docker
+
+```bash
+# Build the image
+docker build -t mcp-foundry-anvil .
+
+# Run the container
+docker run -p 8000:8000 -v foundry_projects:/tmp/foundry_projects mcp-foundry-anvil
+```
+
 ## Requirements
 
+### Local Development
 - Python 3.11+
 - Foundry (forge, anvil, cast)
+- Echidna (optional, for fuzzing)
 - Git
+
+### Docker Development
+- Docker
+- Docker Compose (optional, for easier management)
+
+## Docker Configuration
+
+The project includes comprehensive Docker support with Foundry pre-installed:
+
+### Dockerfile Features
+- **Base Image**: Python 3.11 slim for optimal size
+- **Foundry Integration**: Pre-installed Foundry tools (forge, anvil, cast, chisel)
+- **Echidna Integration**: Pre-installed Echidna fuzzing tool for smart contract testing
+- **System Dependencies**: Includes build tools for Solidity compilation
+- **Package Management**: Uses `uv` for fast dependency resolution
+- **Cache Management**: Persistent volumes for Foundry projects and build artifacts
+- **Health Checks**: Built-in container health monitoring
+
+### Docker Compose Features
+- **Service Management**: Easy start/stop/restart
+- **Volume Persistence**: Foundry projects and cache survive container restarts
+- **Port Mapping**: MCP server accessible on port 8000
+- **Development Mode**: Source code mounting for live development
+- **Health Monitoring**: Automatic health checks and restart policies
+
+### Container Volumes
+- `foundry_projects`: Persistent storage for Foundry project files
+- `build_cache`: Build artifacts cache
+- `deploy_cache`: Deployment scripts cache
+- Source code mounting for development (optional)
 
 
 ## License
