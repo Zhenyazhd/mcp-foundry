@@ -1,12 +1,10 @@
-from mcp_modules.project_secure import ProjectType, get_project_manager, apply_file_modifications, SecurityError
-from mcp_modules.tests_runner import TestRunner, TestConfig, TestResult
-from mcp_modules.scenario import ScenarioRunner, ScenarioParser, ScenarioHelper
-from mcp_modules.echidna_runner import EchidnaRunner, EchidnaConfig, EchidnaResult
-
+from mcp_modules.project_secure import (
+    ProjectType, get_project_manager, SecurityError
+)
 from mcp.server.fastmcp import FastMCP
 from pathlib import Path
-import json, time, subprocess
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional, List
+from mcp_modules.echidna_runner import EchidnaRunner
 import logging
 
 mcp = FastMCP("Smart Contract Project Manager")
@@ -19,16 +17,24 @@ project_manager = get_project_manager()
 ########################################################
 # MAIN TOOLS
 ########################################################
-@mcp.tool()
+@mcp.tool(
+    "project_create",
+    description=(
+        "Create a new Foundry project for a user.\n"
+        "- This initializes a complete Foundry project structure.\n"
+        "- The project_id is auto-generated and returned in the response.\n"
+        "- Use this project_id for all subsequent operations."
+    )
+)
 def project_create(
+    user_id: str,
     project_type: str = "foundry",
     solc_version: str = "0.8.19",
     optimization_enabled: bool = True,
     optimizer_runs: int = 200,
-    evm_version: str = "london",
-    auto_cleanup: bool = True
+    evm_version: str = "london"
 ) -> Dict[str, Any]:
-    """Create a new temporary project with Foundry initialization"""
+    """Create a new temporary project with Foundry initialization for a specific user"""
     try:
         if project_type not in [t.value for t in ProjectType]:
             return {
@@ -37,12 +43,12 @@ def project_create(
             }
         
         project = project_manager.create_project(
+            user_id=user_id,
             project_type=ProjectType(project_type),
             solc_version=solc_version,
             optimization_enabled=optimization_enabled,
             optimizer_runs=optimizer_runs,
-            evm_version=evm_version,
-            auto_cleanup=auto_cleanup
+            evm_version=evm_version
         )
         
         return {
@@ -57,17 +63,33 @@ def project_create(
             "error": str(e)
         }
 
-@mcp.tool()
-def project_list() -> Dict[str, Any]:
-    """List all available projects"""
+@mcp.tool(
+    "project_list",
+    description=(
+        "List all projects for a user or all users.\n"
+        "- If user_id is provided, returns only that user's projects.\n"
+        "- If user_id is None, returns all projects from all users.\n"
+        "- Use this to find existing project_ids before operations.\n"
+        "\n"
+        "Foundry project structure:\n"
+        "- src/ - contract source files (*.sol)\n"
+        "- test/ - test files (*.t.sol)\n"
+        "- script/ - deployment scripts (*.s.sol)\n"
+        "- lib/ - external dependencies (installed via project_install_dependency)\n"
+        "- foundry.toml - project configuration"
+    )
+)
+def project_list(user_id: str = None) -> Dict[str, Any]:
+    """List all available projects for a specific user, or all projects if user_id is None"""
     try:
-        projects = project_manager.list_projects()
+        projects = project_manager.list_projects(user_id)
         
         return {
             "success": True,
             "projects": [project.to_dict() for project in projects],
             "count": len(projects),
-            "message": f"Found {len(projects)} projects"
+            "user_id": user_id or "all",
+            "message": f"Found {len(projects)} projects" + (f" for user {user_id}" if user_id else " for all users")
         }
         
     except Exception as e:
@@ -78,11 +100,19 @@ def project_list() -> Dict[str, Any]:
             "message": "Failed to list projects"
         }
 
-@mcp.tool()
-def project_debug(project_id: str) -> Dict[str, Any]:
+@mcp.tool(
+    "project_debug",
+    description=(
+        "Get detailed debug information about a project.\n"
+        "- Returns project configuration, path, directory contents, and metadata.\n"
+        "- Useful for troubleshooting project issues.\n"
+        "- If project not found, returns list of available project_ids."
+    )
+)
+def project_debug(project_id: str, user_id: str) -> Dict[str, Any]:
     """Debug project information and status"""
     try:
-        project = project_manager.get_project(project_id)
+        project = project_manager.get_project(project_id, user_id)
         
         if not project:
             all_projects = project_manager.list_projects()
@@ -115,8 +145,7 @@ def project_debug(project_id: str) -> Dict[str, Any]:
                 "directory_exists": directory_exists,
                 "directory_contents": directory_contents,
                 "project_type": project.project_type.value,
-                "created_at": project.created_at,
-                "auto_cleanup": project.auto_cleanup
+                "created_at": project.created_at
             },
             "message": f"Project {project_id} found and accessible"
         }
@@ -130,11 +159,19 @@ def project_debug(project_id: str) -> Dict[str, Any]:
             "message": "Failed to debug project"
         }
 
-@mcp.tool()
-def project_get_path(project_id: str) -> Dict[str, Any]:
+@mcp.tool(
+    "project_get_path",
+    description=(
+        "Get the absolute filesystem path to a project directory.\n"
+        "- Returns both absolute and resolved paths.\n"
+        "- Useful for debugging or when you need the exact file path.\n"
+        "- Check directory_exists to verify the project directory exists."
+    )
+)
+def project_get_path(project_id: str, user_id: str) -> Dict[str, Any]:
     """Get the absolute path to a project directory"""
     try:
-        project = project_manager.get_project(project_id)
+        project = project_manager.get_project(project_id, user_id)
         
         if not project:
             all_projects = project_manager.list_projects()
@@ -171,94 +208,85 @@ def project_get_path(project_id: str) -> Dict[str, Any]:
             "message": "Failed to get project path"
         }
 
-@mcp.tool()
-def project_write_file(
+@mcp.tool(
+    "project_write_files",
+    description=(
+        "Write one or multiple files to a project.\n"
+        "- For single file: provide file_path and content.\n"
+        "- For multiple files: provide files dict with {path: content}.\n"
+        "- Paths are relative to project root (e.g., 'src/Contract.sol').\n"
+        "- Automatically creates parent directories if needed.\n"
+        "\n"
+        "Foundry project structure - where to place files:\n"
+        "- src/ContractName.sol - contract source files\n"
+        "- test/ContractName.t.sol - test files (Foundry tests)\n"
+        "- script/Deploy.s.sol - deployment scripts\n"
+        "- foundry.toml - project configuration (solc version, optimizer, etc.)\n"
+        "- lib/ - dependencies (use project_install_dependency, don't write manually)\n"
+        "- echidna.yaml - Echidna fuzzing configuration (if using Echidna)\n"
+        "\n"
+        "Echidna configuration (echidna.yaml) - key parameters:\n"
+        "- testMode: 'property' (default), 'assertion', 'optimization', 'overflow', 'exploration'\n"
+        "- testLimit: number of transaction sequences to generate (default: 50000)\n"
+        "- seqLen: number of transactions per sequence (default: 100)\n"
+        "- shrinkLimit: attempts to shrink failing sequences (default: 5000)\n"
+        "- contractAddr: address to deploy contract (default: '0x00a329c0648769a73afac7f9381e08fb43dbea72')\n"
+        "- coverage: enable coverage-guided fuzzing (default: true)\n"
+        "- corpusDir: directory to save corpus (requires coverage: true)\n"
+        "- sender: list of addresses for transactions (default: ['0x10000', '0x20000', '0x30000'])\n"
+        "- prefix: prefix for property functions (default: 'echidna_')\n"
+        "- format: output format - 'text', 'json', or 'none' (default: null, uses TUI)\n"
+        "- stopOnFail: stop fuzzing on first failure (default: false)\n"
+        "- allContracts: fuzz all deployed contracts with known ABI (default: false)\n"
+        "- allowFFI: allow HEVM ffi cheatcode (default: false)"
+    )
+)
+def project_write_files(
     project_id: str,
-    file_path: str,
-    content: str
+    user_id: str,
+    file_path: str = None,
+    content: str = None,
+    files: Dict[str, str] = None
 ) -> Dict[str, Any]:
-    """Write content to a file (create or overwrite) with security validation"""
+    """Write one or multiple files to project (contracts, tests, scripts, configs, etc.)
+    
+    Args:
+        project_id: The project ID
+        user_id: The user ID
+        file_path: Path to a single file (use with content parameter)
+        content: Content for a single file (use with file_path parameter)
+        files: Dictionary where keys are file paths and values are file contents (for multiple files)
+    
+    Note: Either provide (file_path, content) for a single file, or files dict for multiple files.
+    """
     try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        project_path = Path(project.project_path)
-        
-        # Security validation using SecurePathValidator
-        try:
-            from mcp_modules.project_secure import SecurePathValidator
-            validated_path = SecurePathValidator.validate_path(file_path, project_path)
-        except SecurityError as e:
-            return {
-                "success": False,
-                "error": f"Security validation failed: {e}"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Path validation error: {e}"
-            }
-        
-        # Validate content
-        try:
-            if not SecurePathValidator.validate_file_content(content):
+        # Handle single file case
+        if file_path is not None and content is not None:
+            if files is not None:
                 return {
                     "success": False,
-                    "error": "Content validation failed"
+                    "error": "Cannot specify both single file (file_path/content) and multiple files (files) at the same time"
                 }
-            if not SecurePathValidator.validate_file_size(content):
-                return {
-                    "success": False,
-                    "error": "Content too large"
-                }
-        except SecurityError as e:
-            return {
-                "success": False,
-                "error": f"Content validation failed: {e}"
-            }
+            
+        result = project_manager._write_validated_file(
+            project_id, user_id, file_path, content, must_exist=False
+        )
         
-        # Create parent directories if they don't exist
-        validated_path.parent.mkdir(parents=True, exist_ok=True)
+        if result["success"]:
+            logger.info(f"Wrote file {file_path} in project {project_id}")
+            result["message"] = f"Successfully wrote {file_path}"
         
-        # Write content to file
-        try:
-            with open(validated_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error writing file: {e}"
-            }
+        return result
         
-        logger.info(f"Wrote file {file_path} in project {project_id}")
-        
-        return {
-            "success": True,
-            "file_path": file_path,
-            "absolute_path": str(validated_path),
-            "file_size": len(content.encode('utf-8')),
-            "message": f"Successfully wrote {file_path}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error writing file: {e}")
+        # Handle multiple files case
+        elif files is not None:
+            if file_path is not None or content is not None:
         return {
             "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_add_files(
-    project_id: str,
-    files: Dict[str, str]
-) -> Dict[str, Any]:
-    """Add multiple files to project (contracts, tests, scripts, configs, etc.)"""
-    try:
-        result = project_manager.add_files(project_id, files)
+                    "error": "Cannot specify both single file (file_path/content) and multiple files (files) at the same time"
+                }
+            
+            result = project_manager.write_validated_files(project_id, files, user_id)
         
         return {
             "success": result["success"],
@@ -269,16 +297,31 @@ def project_add_files(
             "message": result.get("message", f"Added {result.get('count', 0)}/{result.get('total_files', 0)} files to project")
         }
         
+        else:
+            return {
+                "success": False,
+                "error": "Must provide either (file_path, content) for a single file or files dict for multiple files"
+            }
+        
     except Exception as e:
-        logger.error(f"Error adding files: {e}")
+        logger.error(f"Error writing files: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
-@mcp.tool()
+@mcp.tool(
+    "project_delete_file",
+    description=(
+        "Delete a file or directory from a project.\n"
+        "- Path is relative to project root (e.g., 'src/OldContract.sol').\n"
+        "- For directories, set recursive=True to delete contents.\n"
+        "- Use with caution: deleted files cannot be recovered."
+    )
+)
 def project_delete_file(
     project_id: str,
+    user_id: str,
     file_path: str,
     recursive: bool = False
 ) -> Dict[str, Any]:
@@ -286,11 +329,12 @@ def project_delete_file(
     
     Args:
         project_id: The project ID
+        user_id: The user ID
         file_path: Path to the file or directory to delete
         recursive: If True, recursively delete directories and their contents
     """
     try:
-        project = project_manager.get_project(project_id)
+        project = project_manager.get_project(project_id, user_id)
         if not project:
             return {
                 "success": False,
@@ -299,10 +343,9 @@ def project_delete_file(
         
         project_path = Path(project.project_path)
         
-        # Security validation using SecurePathValidator
+        # Security validation
         try:
-            from mcp_modules.project_secure import SecurePathValidator
-            validated_path = SecurePathValidator.validate_path(file_path, project_path)
+            validated_path = project_manager.validate_and_resolve_path(file_path, project_path)
         except SecurityError as e:
             return {
                 "success": False,
@@ -350,94 +393,39 @@ def project_delete_file(
             "error": str(e)
         }
 
-@mcp.tool()
+@mcp.tool(
+    "project_modify_file",
+    description=(
+        "Replace the entire content of an existing file.\n"
+        "- File must already exist in the project.\n"
+        "- For complex modifications: read file with project_get_file_content, "
+        "modify content, then write with this function.\n"
+        "- This is a full replacement, not a patch."
+    )
+)
 def project_modify_file(
     project_id: str,
+    user_id: str,
     file_path: str,
-    modifications: Dict[str, Any]
+    new_content: str
 ) -> Dict[str, Any]:
-    """Modify an existing file with specific changes"""
+    """Replace entire file content with new content
+    
+    For complex modifications, agent should:
+    1. Read file with project_get_file_content()
+    2. Modify content as needed
+    3. Write new content with this function or project_write_files()
+    """
     try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
+        result = project_manager._write_validated_file(
+            project_id, user_id, file_path, new_content, must_exist=True
+        )
         
-        project_path = Path(project.project_path)
-        full_path = project_path / file_path
+        if result["success"]:
+            logger.info(f"Modified file {file_path} in project {project_id}")
+            result["message"] = f"Successfully modified {file_path}"
         
-        if not full_path.exists():
-            return {
-                "success": False,
-                "error": f"File {file_path} not found in project"
-            }
-        
-        if full_path.is_dir():
-            return {
-                "success": False,
-                "error": f"Path {file_path} is a directory, not a file. Please specify the full file path."
-            }
-        
-        # Security validation using SecurePathValidator
-        try:
-            from mcp_modules.project_secure import SecurePathValidator
-            validated_path = SecurePathValidator.validate_path(file_path, project_path)
-        except SecurityError as e:
-            return {
-                "success": False,
-                "error": f"Security validation failed: {e}"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Path validation error: {e}"
-            }
-        
-        # Use validated path instead of full_path
-        full_path = validated_path
-        
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                current_content = f.read()
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error reading file: {e}"
-            }
-        
-        try:
-            modified_content = apply_file_modifications(current_content, modifications)
-        except SecurityError as e:
-            return {
-                "success": False,
-                "error": f"Security validation failed: {e}"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error applying modifications: {e}"
-            }
-        
-        try:
-            with open(full_path, 'w', encoding='utf-8') as f:
-                f.write(modified_content)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error writing modified file: {e}"
-            }
-        
-        logger.info(f"Modified file {file_path} in project {project_id}")
-        
-        return {
-            "success": True,
-            "file_path": file_path,
-            "modifications_applied": list(modifications.keys()),
-            "file_size": len(modified_content),
-            "message": f"Successfully modified {file_path}"
-        }
+        return result
         
     except Exception as e:
         logger.error(f"Error modifying file: {e}")
@@ -446,306 +434,53 @@ def project_modify_file(
             "error": str(e)
         }
 
-@mcp.tool()
-def project_modify_files_by_pattern(
-    project_id: str,
-    directory_path: str,
-    file_pattern: str,
-    modifications: Dict[str, Any]
-) -> Dict[str, Any]:
-    """Modify multiple files matching a pattern in a directory"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        project_path = Path(project.project_path)
-        target_dir = project_path / directory_path
-        
-        if not target_dir.exists() or not target_dir.is_dir():
-            return {
-                "success": False,
-                "error": f"Directory {directory_path} not found in project"
-            }
-        
-        try:
-            target_dir.resolve().relative_to(project_path.resolve())
-        except ValueError:
-            return {
-                "success": False,
-                "error": "Directory path is outside project directory"
-            }
-        
-        import glob
-        pattern_path = target_dir / file_pattern
-        matching_files = glob.glob(str(pattern_path), recursive=True)
-        
-        if not matching_files:
-            return {
-                "success": False,
-                "error": f"No files found matching pattern {file_pattern} in {directory_path}"
-            }
-        
-        modified_files = []
-        errors = []
-        
-        for file_path in matching_files:
-            try:
-                file_path_obj = Path(file_path)
-                
-                if file_path_obj.is_dir():
-                    continue
-                
-                with open(file_path_obj, 'r', encoding='utf-8') as f:
-                    current_content = f.read()
-                
-                try:
-                    modified_content = apply_file_modifications(current_content, modifications)
-                except SecurityError as e:
-                    error_msg = f"Security validation failed for {file_path}: {e}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    continue
-                except Exception as e:
-                    error_msg = f"Error applying modifications to {file_path}: {e}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    continue
-                
-                with open(file_path_obj, 'w', encoding='utf-8') as f:
-                    f.write(modified_content)
-                
-                relative_path = file_path_obj.relative_to(project_path)
-                modified_files.append(str(relative_path))
-                
-                logger.info(f"Modified file {relative_path} in project {project_id}")
-                
-            except Exception as e:
-                error_msg = f"Failed to modify {file_path}: {str(e)}"
-                errors.append(error_msg)
-                logger.error(error_msg)
-        
-        return {
-            "success": len(errors) == 0,
-            "modified_files": modified_files,
-            "count": len(modified_files),
-            "total_files": len(matching_files),
-            "errors": errors if errors else None,
-            "message": f"Modified {len(modified_files)}/{len(matching_files)} files matching pattern {file_pattern}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error modifying files by pattern: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_download_file_from_github(
-    project_id: str,
-    github_url: str,
-    target_path: str,
-    branch: str = "main"
-) -> Dict[str, Any]:
-    """Download a single file from GitHub repository to project directory"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        project_path = Path(project.project_path)
-        
-        github_info = _parse_github_url(github_url)
-        if not github_info:
-            return {
-                "success": False,
-                "error": "Invalid GitHub URL format. Expected: https://github.com/owner/repo/blob/branch/path/to/file"
-            }
-        
-        file_content = _download_file_from_github(github_info["owner"], github_info["repo"], github_info["file_path"], branch)
-        if not file_content:
-            return {
-                "success": False,
-                "error": f"Failed to download file from GitHub: {github_url}"
-            }
-        
-        target_path_obj = Path(target_path)
-        if target_path_obj.parts[0] in ['src', 'test', 'script']:
-            target_dir = project_path / target_path_obj.parent
-        else:
-            target_dir = project_path / "src" / target_path_obj.parent
-        
-        target_dir.mkdir(exist_ok=True, parents=True)
-        final_file_path = target_dir / target_path_obj.name
-        
-        try:
-            with open(final_file_path, 'w', encoding='utf-8') as f:
-                f.write(file_content)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error writing downloaded file: {e}"
-            }
-        
-        logger.info(f"Downloaded file from GitHub to {final_file_path.relative_to(project_path)} in project {project_id}")
-        
-        return {
-            "success": True,
-            "file_path": str(final_file_path.relative_to(project_path)),
-            "github_url": github_url,
-            "file_size": len(file_content),
-            "message": f"Successfully downloaded file from {github_url}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error downloading file from GitHub: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_download_multiple_files_from_github(
-    project_id: str,
-    github_urls: List[Dict[str, str]]
-) -> Dict[str, Any]:
-    """Download multiple files from GitHub repositories to project directory
-    
-    Args:
-        github_urls: List of dictionaries with keys: 'url', 'target_path', 'branch' (optional)
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        downloaded_files = []
-        errors = []
-        
-        for file_info in github_urls:
-            github_url = file_info.get("url")
-            target_path = file_info.get("target_path")
-            branch = file_info.get("branch", "main")
-            
-            if not github_url or not target_path:
-                errors.append(f"Missing url or target_path in file info: {file_info}")
-                continue
-            
-            result = project_download_file_from_github(project_id, github_url, target_path, branch)
-            
-            if result["success"]:
-                downloaded_files.append({
-                    "url": github_url,
-                    "target_path": target_path,
-                    "file_path": result["file_path"],
-                    "file_size": result["file_size"]
-                })
-            else:
-                errors.append(f"Failed to download {github_url}: {result['error']}")
-        
-        return {
-            "success": len(errors) == 0,
-            "downloaded_files": downloaded_files,
-            "count": len(downloaded_files),
-            "total_files": len(github_urls),
-            "errors": errors if errors else None,
-            "message": f"Downloaded {len(downloaded_files)}/{len(github_urls)} files from GitHub"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error downloading multiple files from GitHub: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-def _parse_github_url(url: str) -> Optional[Dict[str, str]]:
-    """Parse GitHub URL to extract owner, repo, and file path"""
-    import re
-    
-    pattern = r'https://github\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.+)'
-    match = re.match(pattern, url)
-    
-    if match:
-        return {
-            "owner": match.group(1),
-            "repo": match.group(2),
-            "branch": match.group(3),
-            "file_path": match.group(4)
-        }
-    
-    pattern_raw = r'https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)'
-    match_raw = re.match(pattern_raw, url)
-    
-    if match_raw:
-        return {
-            "owner": match_raw.group(1),
-            "repo": match_raw.group(2),
-            "branch": match_raw.group(3),
-            "file_path": match_raw.group(4)
-        }
-    
-    return None
-
-def _download_file_from_github(owner: str, repo: str, file_path: str, branch: str = "main") -> Optional[str]:
-    """Download file content from GitHub using raw URL"""
-    try:
-        import requests
-        
-        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
-        
-        logger.info(f"Downloading file from: {raw_url}")
-        
-        response = requests.get(raw_url, timeout=30)
-        response.raise_for_status()
-        
-        return response.text
-        
-    except requests.RequestException as e:
-        logger.error(f"Failed to download file from GitHub: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error downloading file: {e}")
-        return None
-
-@mcp.tool()
-def project_list() -> Dict[str, Any]:
-    """List all projects"""
-    try:
-        projects = project_manager.list_projects()
-        
-        return {
-            "success": True,
-            "projects": [p.to_dict() for p in projects],
-            "count": len(projects)
-        }
-        
-    except Exception as e:
-        logger.error(f"Error listing projects: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_compile(project_id: str) -> Dict[str, Any]:
+@mcp.tool(
+    "project_compile",
+    description=(
+        "Compile a Foundry project for this user.\n"
+        "- Always call this before running tests or Echidna.\n"
+        "- If compilation fails with a solc version error, "
+        "do NOT try to install solc yourself; instead, call `project_set_solc_version` "
+        "or suggest a compatible pragma."
+    )
+)
+def project_compile(project_id: str, user_id: str) -> Dict[str, Any]:
     """Compile project contracts"""
     try:
-        result = project_manager.compile_project(project_id)
+        from mcp_modules.build import BuildManager, BuildConfig, BuildToolchain
+        
+        project = project_manager.get_project(project_id, user_id)
+        if not project:
+            return {
+            "success": False,
+                "error": f"Project {project_id} not found for user {user_id}"
+            }
+        
+        project_path = Path(project.project_path)
+        build_manager = BuildManager(str(project_path))
+        
+        config = BuildConfig(
+            toolchain=BuildToolchain.FOUNDRY,
+            solc_version=project.solc_version,
+            source_dir="src",
+            output_dir="out",
+            optimization_enabled=project.optimization_enabled,
+            optimizer_runs=project.optimizer_runs,
+            evm_version=project.evm_version
+        )
+        
+        result = build_manager.compile(config)
         
         return {
-            "success": result.get("success", False),
-            "compilation_result": result,
+            "success": result.success,
+            "compilation_result": {
+                "success": result.success,
+                "artifacts": result.artifacts,
+                "compilation_time": result.compilation_time,
+                "errors": result.errors,
+                "warnings": result.warnings,
+                "project_type": project.project_type.value
+            },
             "project_id": project_id
         }
         
@@ -756,56 +491,162 @@ def project_compile(project_id: str) -> Dict[str, Any]:
             "error": str(e)
         }
 
-@mcp.tool()
-def project_start_anvil(project_id: str) -> Dict[str, Any]:
-    """Start Anvil instance for specific project"""
+@mcp.tool(
+    "project_run_tests",
+    description=(
+        "Run Foundry tests for a project.\n"
+        "- Always compile the project first using project_compile.\n"
+        "- Use pattern to filter tests by name (passed as -m pattern to forge test).\n"
+        "- Use extra_args for advanced options like --ffi, -vvv, --match-contract, etc.\n"
+        "- Parse stdout/stderr to see test results and failures."
+    )
+)
+def project_run_tests(
+    project_id: str,
+    user_id: str,
+    pattern: str = None,
+    extra_args: List[str] = None
+) -> Dict[str, Any]:
+    """Run tests for the project
+    
+    Args:
+        project_id: The project ID
+        user_id: The user ID
+        pattern: Test name pattern to filter (passed as `-m pattern` to forge test)
+        extra_args: Extra CLI args to append (e.g., ["--ffi", "-vvv", "--match-contract", "MyTest"])
+    
+    Returns:
+        Test results with stdout, stderr, duration, and success status
+    """
     try:
-        result = project_manager.start_project_anvil(project_id)
+        from mcp_modules.build import BuildManager
+        
+        project = project_manager.get_project(project_id, user_id)
+        if not project:
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found for user {user_id}"
+            }
+        
+        project_path = Path(project.project_path)
+        build_manager = BuildManager(str(project_path))
+        
+        result = build_manager.run_tests(
+            pattern=pattern,
+            extra_args=extra_args
+        )
         
         return {
-            "success": result["success"],
-            "anvil_port": result.get("anvil_port"),
-            "anvil_chain_id": result.get("anvil_chain_id"),
-            "rpc_url": result.get("rpc_url"),
-            "message": result.get("message"),
-            "error": result.get("error")
+            "success": result.success,
+            "test_result": {
+                "success": result.success,
+                "return_code": result.return_code,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "duration": result.duration
+            },
+            "project_id": project_id,
+            "message": "Tests completed successfully" if result.success else "Tests failed"
         }
         
     except Exception as e:
-        logger.error(f"Error starting Anvil for project: {e}")
+        logger.error(f"Error running tests: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
-@mcp.tool()
-def project_stop_anvil(project_id: str) -> Dict[str, Any]:
-    """Stop Anvil instance for specific project"""
+@mcp.tool(
+    "project_run_echidna",
+    description=(
+        "Run Echidna fuzzing tests for a project.\n"
+        "- Always compile the project first using project_compile.\n"
+        "- Command must be a full list: ['echidna', 'test/MyTest.sol', '--config', 'echidna.yaml', '--test-limit', '1000'].\n"
+        "- Agent must construct the complete command including all flags.\n"
+        "- Parse stdout/stderr to see fuzzing results and property violations.\n"
+        "\n"
+        "Echidna configuration (echidna.yaml):\n"
+        "- testMode: 'property' (user-defined properties), 'assertion' (assert failures), "
+        "'optimization' (find max value), 'overflow' (detect overflows), 'exploration' (no tests)\n"
+        "- testLimit: number of transaction sequences (default: 50000, can override with --test-limit)\n"
+        "- seqLen: transactions per sequence (default: 100)\n"
+        "- shrinkLimit: attempts to minimize failing sequences (default: 5000)\n"
+        "- contractAddr: deployment address (default: '0x00a329c0648769a73afac7f9381e08fb43dbea72')\n"
+        "- coverage: enable coverage-guided fuzzing (default: true)\n"
+        "- corpusDir: save corpus directory (requires coverage: true)\n"
+        "- sender: list of addresses for transactions (default: ['0x10000', '0x20000', '0x30000'])\n"
+        "- prefix: property function prefix (default: 'echidna_') - functions starting with this are tested\n"
+        "- format: 'text', 'json', or 'none' (default: null uses TUI)\n"
+        "- stopOnFail: stop on first failure (default: false)\n"
+        "- allContracts: fuzz all deployed contracts (default: false)\n"
+        "- allowFFI: allow HEVM ffi cheatcode (default: false)\n"
+        "\n"
+        "Property functions must start with the prefix (default 'echidna_') and return bool."
+    )
+)
+def project_run_echidna(
+    project_id: str,
+    user_id: str,
+    command: List[str],
+    timeout: int = 300
+) -> Dict[str, Any]:
+    """Run Echidna fuzzing tests for the project.
+    
+    Args:
+        project_id: The project ID
+        user_id: The user ID
+        command: List of command arguments for echidna (e.g., ["echidna", "test/MyTest.sol", "--config", "echidna.yaml", "--test-limit", "1000"])
+        timeout: Command timeout in seconds (default: 300)
+    
+    Note: Agent should construct the full command including:
+    - Target test file path
+    - Config file path (if needed)
+    - Test parameters (--test-limit, --seed, etc.)
+    - Output format (--format text/json)
+    """
     try:
-        result = project_manager.stop_project_anvil(project_id)
-        
+        project = project_manager.get_project(project_id, user_id)
+        if not project:
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found for user {user_id}"
+            }
+
+        runner = EchidnaRunner(project.project_path)
+        result = runner.run(command, timeout=timeout)
+
         return {
             "success": result["success"],
-            "message": result.get("message"),
-            "error": result.get("error")
+            "return_code": result["return_code"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "project_id": project_id,
         }
-        
     except Exception as e:
-        logger.error(f"Error stopping Anvil for project: {e}")
+        logger.error(f"Error running Echidna for project {project_id}: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
-@mcp.tool()
-def project_cleanup_all() -> Dict[str, Any]:
-    """Clean up all projects"""
+@mcp.tool(
+    "project_cleanup_all",
+    description=(
+        "Delete all projects for a user or all users.\n"
+        "- If user_id is provided, deletes only that user's projects.\n"
+        "- If user_id is None, deletes ALL projects from ALL users.\n"
+        "- This permanently removes project directories and cannot be undone."
+    )
+)
+def project_cleanup_all(user_id: str = None) -> Dict[str, Any]:
+    """Clean up all projects for a specific user, or all projects if user_id is None"""
     try:
-        project_manager.cleanup_all_projects()
+        project_manager.cleanup_all_projects(user_id)
         
+        message = f"All projects cleaned up successfully" + (f" for user {user_id}" if user_id else " for all users")
         return {
             "success": True,
-            "message": "All projects cleaned up successfully"
+            "message": message
         }
         
     except Exception as e:
@@ -815,226 +656,127 @@ def project_cleanup_all() -> Dict[str, Any]:
             "error": str(e)
         }
 
-@mcp.tool()
-def test_run_all(
+@mcp.tool(
+    "project_get_deployment_artifacts",
+    description=(
+        "Get compilation artifacts (ABI, bytecode) for deployment.\n"
+        "- Automatically compiles the project if needed.\n"
+        "- Returns artifacts with ABI, bytecode, and contract info.\n"
+        "- Use this data to generate deployment script content, "
+        "then write it with project_write_deployment_script."
+    )
+)
+def project_get_deployment_artifacts(
     project_id: str,
-    timeout: int = 300,
-    verbosity: int = 2
+    user_id: str
 ) -> Dict[str, Any]:
-    """Run all tests for a project"""
+    """Get compilation artifacts for generating deployment script
+    
+    Returns artifacts with ABI, bytecode, and contract information.
+    Agent should use this data to generate deployment script content,
+    then use project_write_deployment_script() to write it.
+    """
     try:
-        project = project_manager.get_project(project_id)
+        from mcp_modules.build import BuildManager, BuildConfig, BuildToolchain
+        
+        project = project_manager.get_project(project_id, user_id)
         if not project:
             return {
                 "success": False,
-                "error": f"Project {project_id} not found"
+                "error": f"Project {project_id} not found for user {user_id}"
             }
         
-        config = TestConfig(
-            timeout=timeout,
-            verbosity=verbosity,
-            gas_reports=True
+        project_path = Path(project.project_path)
+        build_manager = BuildManager(str(project_path))
+        
+        config = BuildConfig(
+            toolchain=BuildToolchain.FOUNDRY,
+            solc_version=project.solc_version,
+            source_dir="src",
+            output_dir="out",
+            optimization_enabled=project.optimization_enabled,
+            optimizer_runs=project.optimizer_runs,
+            evm_version=project.evm_version
         )
         
-        runner = TestRunner(project.project_path)        
-        result = runner.run_all_tests(config)
+        compile_result = build_manager.compile(config)
         
-        return {
-            "success": result.success,
-            "total_tests": result.total_tests,
-            "passed_tests": result.passed_tests,
-            "failed_tests": result.failed_tests,
-            "skipped_tests": result.skipped_tests,
-            "execution_time": result.execution_time,
-            "output": result.output,
-            "error_message": result.error_message
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running all tests: {e}")
-        return {
+        if not compile_result.success:
+            return {
             "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def test_run_fuzz(
-    project_id: str,
-    runs: int = 1000,
-    timeout: int = 300,
-    verbosity: int = 2
-) -> Dict[str, Any]:
-    """Run fuzz tests for a project"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
+                "error": "Project compilation failed",
+                "compilation_errors": compile_result.errors
+            }
+        
+        artifacts = compile_result.artifacts
+        if not artifacts:
             return {
                 "success": False,
-                "error": f"Project {project_id} not found"
+                "error": "No artifacts found. Make sure the project has contracts and has been compiled successfully."
             }
         
-        config = TestConfig(
-            runs=runs,
-            timeout=timeout,
-            verbosity=verbosity,
-            gas_reports=True
+        return {
+            "success": True,
+            "artifacts": artifacts,
+            "solc_version": project.solc_version,
+            "project_path": project.project_path,
+            "message": f"Found {len(artifacts)} contract artifacts"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting deployment artifacts: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@mcp.tool(
+    "project_write_deployment_script",
+    description=(
+        "Write a Foundry deployment script to the project.\n"
+        "- Generate script content based on artifacts from project_get_deployment_artifacts.\n"
+        "- Script must be valid Solidity code for Foundry Script.\n"
+        "- Default path is 'script/Deploy.s.sol' but can be customized."
+    )
+)
+def project_write_deployment_script(
+    project_id: str,
+    user_id: str,
+    script_content: str,
+    script_path: str = "script/Deploy.s.sol"
+) -> Dict[str, Any]:
+    """Write deployment script content to file
+    
+    Agent should generate the script content based on artifacts from
+    project_get_deployment_artifacts(), then use this function to write it.
+    """
+    try:
+        result = project_manager.write_deployment_script(
+            project_id, user_id, script_content, script_path
         )
         
-        runner = TestRunner(project.project_path)
-        result = runner.run_fuzz_tests(config)
-        
-        return {
-            "success": result.success,
-            "total_tests": result.total_tests,
-            "passed_tests": result.passed_tests,
-            "failed_tests": result.failed_tests,
-            "skipped_tests": result.skipped_tests,
-            "execution_time": result.execution_time,
-            "output": result.output,
-            "error_message": result.error_message
-        }
+        return result
         
     except Exception as e:
-        logger.error(f"Error running fuzz tests: {e}")
+        logger.error(f"Error writing deployment script: {e}")
         return {
             "success": False,
             "error": str(e)
         }
 
-@mcp.tool()
-def test_run_coverage(
-    project_id: str,
-    timeout: int = 300,
-    verbosity: int = 2
-) -> Dict[str, Any]:
-    """Run coverage analysis for a project"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        config = TestConfig(
-            timeout=timeout,
-            verbosity=verbosity,
-            gas_reports=True
-        )
-        
-        runner = TestRunner(project.project_path)
-        result = runner.run_coverage_analysis(config)
-        
-        return {
-            "success": result["success"],
-            "execution_time": result["execution_time"],
-            "coverage_data": result["coverage_data"],
-            "output": result["output"],
-            "error_message": result["error_message"]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running coverage analysis: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def test_get_gas_reports(
-    project_id: str,
-    timeout: int = 300,
-    verbosity: int = 2
-) -> Dict[str, Any]:
-    """Get gas reports by running tests with gas reporting enabled"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        config = TestConfig(
-            timeout=timeout,
-            verbosity=verbosity,
-            gas_reports=True
-        )
-        
-        runner = TestRunner(project.project_path)
-        
-        result = runner.run_all_tests(config)
-        
-        return {
-            "success": result.success,
-            "gas_report": result.gas_report,
-            "execution_time": result.execution_time,
-            "total_tests": result.total_tests,
-            "passed_tests": result.passed_tests,
-            "failed_tests": result.failed_tests,
-            "output": result.output,
-            "error_message": result.error_message
-        }
-        
-    except Exception as e:
-        logger.error(f"Error getting gas reports: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_generate_deployment_script(
-    project_id: str,
-    deployment_requirements: str = None
-) -> Dict[str, Any]:
-    """Generate deployment script for project based on artifacts"""
-    try:
-        from mcp_modules.project import generate_deployment_script
-        
-        result = generate_deployment_script(project_id, deployment_requirements)
-        
-        return {
-            "success": result.get("success", False),
-            "script_path": result.get("script_path"),
-            "artifacts_analyzed": result.get("artifacts_analyzed", 0),
-            "contracts": result.get("contracts", []),
-            "error": result.get("error")
-        }
-        
-    except Exception as e:
-        logger.error(f"Error generating deployment script: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def project_analyze_artifacts(project_id: str) -> Dict[str, Any]:
-    """Analyze contract artifacts for deployment information"""
-    try:
-        from mcp_modules.project import analyze_contract_artifacts
-        
-        result = analyze_contract_artifacts(project_id)
-        
-        return {
-            "success": result.get("success", False),
-            "contracts": result.get("contracts", {}),
-            "total_contracts": result.get("total_contracts", 0),
-            "analysis_summary": result.get("analysis_summary", {}),
-            "error": result.get("error")
-        }
-        
-    except Exception as e:
-        logger.error(f"Error analyzing artifacts: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
+@mcp.tool(
+    "project_deploy",
+    description=(
+        "Deploy contracts using a Foundry deployment script.\n"
+        "- Requires a deployment script (use project_write_deployment_script first).\n"
+        "- Default RPC is localhost:8545 (Anvil).\n"
+        "- If broadcast=True, transactions are actually sent to the chain.\n"
+        "- Parse stdout/stderr to extract contract addresses and transaction hashes."
+    )
+)
 def project_deploy(
     project_id: str,
+    user_id: str,
     script_path: str = None,
     rpc_url: str = "http://localhost:8545",
     private_key: str = None,
@@ -1042,28 +784,44 @@ def project_deploy(
     transaction_type: str = "1559",
     **kwargs
 ) -> Dict[str, Any]:
-    """Deploy project contracts"""
+    """Deploy project contracts using forge script
+    
+    Agent should parse stdout/stderr to extract contract addresses and transaction hashes.
+    """
     try:
+        from mcp_modules.build import BuildManager
+        
         if transaction_type not in ["legacy", "1559"]:
             return {
                 "success": False,
                 "error": "Transaction type must be 'legacy' or '1559'"
             }
         
-        result = project_manager.deploy_project(
-            project_id=project_id,
+        project = project_manager.get_project(project_id, user_id)
+        if not project:
+            return {
+                "success": False,
+                "error": f"Project {project_id} not found for user {user_id}"
+            }
+        
+        if not script_path:
+            script_path = "script/Deploy.s.sol"
+        
+        build_manager = BuildManager(project.project_path)
+        result = build_manager.run_script(
             script_path=script_path,
             rpc_url=rpc_url,
             private_key=private_key,
             broadcast=broadcast,
             transaction_type=transaction_type,
-            **kwargs
+            extra_args=kwargs.get("extra_args")
         )
         
         return {
-            "success": result.get("success", False),
-            "deployment_result": result,
-            "project_id": project_id
+            "success": result.success,
+            "deployment_result": result.to_dict(),
+            "project_id": project_id,
+            "message": "Deployment completed. Parse stdout/stderr to extract contract addresses and transaction hashes."
         }
         
     except Exception as e:
@@ -1073,15 +831,25 @@ def project_deploy(
             "error": str(e)
         }
 
-@mcp.tool()
+@mcp.tool(
+    "project_install_dependency",
+    description=(
+        "Install an external dependency in a Foundry project.\n"
+        "- Use this to add libraries like OpenZeppelin.\n"
+        "- Dependency URL can be a GitHub repo (e.g., 'OpenZeppelin/openzeppelin-contracts').\n"
+        "- Optional branch parameter for specific versions.\n"
+        "- Installs to lib/ directory using forge install."
+    )
+)
 def project_install_dependency(
     project_id: str,
+    user_id: str,
     dependency_url: str,
     branch: str = None
 ) -> Dict[str, Any]:
     """Install external dependency (e.g., OpenZeppelin) in Foundry project"""
     try:
-        result = project_manager.install_dependency(project_id, dependency_url, branch)
+        result = project_manager.install_dependency(project_id, dependency_url, user_id, branch)
         
         return {
             "success": result["success"],
@@ -1100,296 +868,32 @@ def project_install_dependency(
             "error": str(e)
         }
 
-
-
-########################################################
-# SCENARIO TOOLS (NOT IMPLEMENTED)
-########################################################
-
-@mcp.tool()
-def scenario_run_from_file(
-    project_id: str,
-    scenario_file: str,
-    rpc_url: Optional[str] = None
-) -> Dict[str, Any]:
-    """Run a scenario from YAML file"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        project_path = Path(project.project_path)
-        scenario_path = project_path / scenario_file
-        
-        if not scenario_path.exists():
-            return {
-                "success": False,
-                "error": f"Scenario file not found: {scenario_file}"
-            }
-        
-        runner = ScenarioRunner(rpc_url or "http://localhost:8545")
-        result = runner.run_scenario_from_file(scenario_path)
-        
-        return {
-            "success": result.success,
-            "scenario_name": result.scenario_name,
-            "execution_time": result.execution_time,
-            "steps_executed": result.steps_executed,
-            "total_steps": result.total_steps,
-            "artifacts": result.artifacts,
-            "error": result.error,
-            "gas_used": result.gas_used,
-            "events": result.events
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running scenario: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@mcp.tool()
-def scenario_run_from_yaml(
-    project_id: str,
-    yaml_content: str,
-    rpc_url: Optional[str] = None
-) -> Dict[str, Any]:
-    """Run a scenario from YAML content"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        runner = ScenarioRunner(rpc_url or "http://localhost:8545")
-        result = runner.run_scenario_from_yaml(yaml_content)
-        
-        return {
-            "success": result.success,
-            "scenario_name": result.scenario_name,
-            "execution_time": result.execution_time,
-            "steps_executed": result.steps_executed,
-            "total_steps": result.total_steps,
-            "artifacts": result.artifacts,
-            "error": result.error,
-            "gas_used": result.gas_used,
-            "events": result.events
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running scenario: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@mcp.tool()
-def scenario_create_template(
-    project_id: str,
-    contract_name: str,
-    scenario_type: str = "custom"
-) -> Dict[str, Any]:
-    """Create scenario template for agent based on contract ABI"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        compile_result = project_manager.compile_project(project_id)
-        
-        if not compile_result.get("success", False):
-            return {
-                "success": False,
-                "error": f"Compilation failed: {compile_result.get('errors', 'Unknown error')}"
-            }
-        
-        artifacts = compile_result.get("artifacts", [])
-        contract_abi = None
-        for artifact in artifacts:
-            if artifact["name"] == contract_name:
-                contract_abi = artifact.get("abi", [])
-                break
-        
-        if not contract_abi:
-            return {
-                "success": False,
-                "error": f"Contract {contract_name} not found in artifacts"
-            }
-        
-        helper = ScenarioHelper()
-        template = helper.create_scenario_template(contract_name, contract_abi, scenario_type)
-        
-        return {
-            "success": True,
-            "template": template,
-            "message": f"Scenario template created for {contract_name}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error creating scenario template: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@mcp.tool()
-def scenario_parse_yaml(
-    yaml_content: str
-) -> Dict[str, Any]:
-    """Parse YAML scenario and return structured data"""
-    try:
-        parser = ScenarioParser()
-        scenario = parser.parse_yaml(yaml_content)
-        
-        return {
-            "success": True,
-            "scenario": {
-                "name": scenario.name,
-                "description": scenario.description,
-                "roles": {name: role.address for name, role in scenario.roles.items()},
-                "contracts": scenario.contracts,
-                "steps": [
-                    {
-                        "type": step.type.value,
-                        "data": step.data,
-                        "description": step.description
-                    }
-                    for step in scenario.steps
-                ],
-                "timeout": scenario.timeout,
-                "gas_limit": scenario.gas_limit
-            }
-        }
-        
-    except Exception as e:
-        logger.error(f"Error parsing YAML: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
-def scenario_save_to_file(
-    project_id: str,
-    scenario_name: str,
-    yaml_content: str
-) -> Dict[str, Any]:
-    """Save scenario YAML to project file"""
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        project_path = Path(project.project_path)
-        scenarios_dir = project_path / "scenarios"
-        scenarios_dir.mkdir(exist_ok=True)
-        
-        scenario_file = scenarios_dir / f"{scenario_name}.yaml"
-        
-        with open(scenario_file, 'w', encoding='utf-8') as f:
-            f.write(yaml_content)
-        
-        return {
-            "success": True,
-            "scenario_file": str(scenario_file.relative_to(project_path)),
-            "message": f"Scenario saved to {scenario_file.name}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error saving scenario: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-@mcp.tool()
-def scenario_start_local_chain(
-    port: int = 8545
-) -> Dict[str, Any]:
-    """Start local Anvil chain for scenario testing"""
-    try:
-        runner = ScenarioRunner()
-        success = runner.start_local_chain(port)
-        
-        if success:
-            return {
-                "success": True,
-                "rpc_url": f"http://localhost:{port}",
-                "message": f"Local chain started on port {port}"
-            }
-        else:
-            return {
-                "success": False,
-                "error": "Failed to start local chain"
-            }
-        
-    except Exception as e:
-        logger.error(f"Error starting local chain: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-
-@mcp.tool()
-def project_install_multiple_dependencies(
-    project_id: str,
-    dependencies: List[Dict[str, str]]
-) -> Dict[str, Any]:
-    """Install multiple dependencies at once"""
-    try:
-        result = project_manager.install_multiple_dependencies(project_id, dependencies)
-        
-        return {
-            "success": result["success"],
-            "project_id": project_id,
-            "total_dependencies": result["total_dependencies"],
-            "successful_installs": result["successful_installs"],
-            "failed_installs": result["failed_installs"],
-            "results": result["results"],
-            "message": f"Installed {result['successful_installs']}/{result['total_dependencies']} dependencies"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error installing multiple dependencies: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-@mcp.tool()
+@mcp.tool(
+    "project_get_file_content",
+    description=(
+        "Read the content of any file from a project.\n"
+        "- Use this to read contracts, tests, configs, or any project file.\n"
+        "- Path is relative to project root (e.g., 'src/Contract.sol').\n"
+        "- Returns file content, metadata (size, timestamps), and absolute path."
+    )
+)
 def project_get_file_content(
     project_id: str,
+    user_id: str,
     file_path: str
 ) -> Dict[str, Any]:
     """Get content of any file from project directory
     
     Args:
         project_id: Project identifier
+        user_id: User identifier
         file_path: Path to file relative to project root (e.g., "src/Contract.sol", "test/Test.t.sol", "foundry.toml")
     
     Returns:
         File content with metadata including size, timestamps, and absolute path
     """
     try:
-        result = project_manager.get_file_content(project_id, file_path)
+        result = project_manager.get_file_content(project_id, file_path, user_id)
         
         if result["success"]:
             return {
@@ -1418,9 +922,19 @@ def project_get_file_content(
             "file_path": file_path
         }
 
-@mcp.tool()
+@mcp.tool(
+    "project_list_files",
+    description=(
+        "List files and directories in a project.\n"
+        "- If directory is None, lists root directory.\n"
+        "- Use file_pattern to filter (e.g., '*.sol', '*.t.sol', '*.toml').\n"
+        "- Returns files with metadata (size, timestamps) and subdirectories.\n"
+        "- Useful for exploring project structure."
+    )
+)
 def project_list_files(
     project_id: str,
+    user_id: str,
     directory: str = None,
     file_pattern: str = None
 ) -> Dict[str, Any]:
@@ -1428,6 +942,7 @@ def project_list_files(
     
     Args:
         project_id: Project identifier
+        user_id: User identifier
         directory: Subdirectory to list (e.g., "src", "test", "script"). If None, lists root directory
         file_pattern: File pattern to filter (e.g., "*.sol", "*.t.sol", "*.toml"). If None, lists all files
     
@@ -1435,7 +950,7 @@ def project_list_files(
         List of files and directories with metadata
     """
     try:
-        result = project_manager.list_project_files(project_id, directory, file_pattern)
+        result = project_manager.list_project_files(project_id, user_id, directory, file_pattern)
         
         if result["success"]:
             return {
@@ -1468,425 +983,6 @@ def project_list_files(
             "file_pattern": file_pattern
         }
 
-@mcp.tool()
-def echidna_run_tests(
-    project_id: str,
-    runs: int = 1000,
-    timeout: int = 300,
-    gas_limit: int = 30000000,
-    contract: str = None,
-    test_mode: str = "property",
-    seed: int = None,
-    verbosity: int = 2,
-    coverage: bool = True,
-    corpus_dir: str = None
-) -> Dict[str, Any]:
-    """Run Echidna fuzz tests on project contracts
-    
-    Args:
-        project_id: Project identifier
-        runs: Number of fuzzing runs (default: 1000)
-        timeout: Test timeout in seconds (default: 300)
-        gas_limit: Gas limit for transactions (default: 30000000)
-        contract: Specific contract to test (optional)
-        test_mode: Test mode - "property" or "assertion" (default: "property")
-        seed: Random seed for reproducible results (optional)
-        verbosity: Output verbosity level 0-4 (default: 2)
-        coverage: Enable coverage analysis (default: True)
-        corpus_dir: Directory for corpus files (optional)
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        config = EchidnaConfig(
-            runs=runs,
-            timeout=timeout,
-            gas_limit=gas_limit,
-            contract=contract,
-            test_mode=test_mode,
-            seed=seed,
-            verbosity=verbosity,
-            coverage=coverage,
-            corpus_dir=corpus_dir
-        )
-        
-        runner = EchidnaRunner(project.project_path)
-        result = runner.run_tests(config)
-        
-        return {
-            "success": result.success,
-            "project_id": project_id,
-            "total_tests": result.total_tests,
-            "passed_tests": result.passed_tests,
-            "failed_tests": result.failed_tests,
-            "coverage_percentage": result.coverage_percentage,
-            "execution_time": result.execution_time,
-            "fuzzing_stats": result.fuzzing_stats,
-            "findings": result.findings,
-            "config": result.config.to_dict(),
-            "output": result.output,
-            "error_output": result.error_output,
-            "message": f"Echidna tests completed: {result.passed_tests}/{result.total_tests} passed"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error running Echidna tests: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "project_id": project_id
-        }
-
-@mcp.tool()
-def echidna_create_property_test(
-    project_id: str,
-    contract_name: str,
-    test_file_name: str = None
-) -> Dict[str, Any]:
-    """Create a sample property test contract for Echidna
-    
-    Args:
-        project_id: Project identifier
-        contract_name: Name of the contract to test
-        test_file_name: Name for the test file (optional, defaults to {ContractName}EchidnaTest.sol)
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        runner = EchidnaRunner(project.project_path)
-        
-        test_content = runner.create_sample_property_test(contract_name)
-        
-        if not test_file_name:
-            test_file_name = f"{contract_name}EchidnaTest.sol"
-        
-        test_files = {
-            test_file_name: test_content
-        }
-        
-        add_result = project_manager.add_files(project_id, test_files)
-        
-        if add_result["success"]:
-            return {
-                "success": True,
-                "project_id": project_id,
-                "contract_name": contract_name,
-                "test_file": test_file_name,
-                "test_content": test_content,
-                "message": f"Created Echidna property test for {contract_name}"
-            }
-        else:
-            return {
-                "success": False,
-                "error": add_result["error"],
-                "project_id": project_id
-            }
-        
-    except Exception as e:
-        logger.error(f"Error creating Echidna property test: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "project_id": project_id
-        }
-
-@mcp.tool()
-def echidna_check_installation() -> Dict[str, Any]:
-    """Check if Echidna is installed and available"""
-    try:
-        runner = EchidnaRunner("/tmp")  
-        is_installed = runner._check_echidna_installed()
-        
-        if is_installed:
-            try:
-                result = subprocess.run(
-                    ["echidna", "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                version_info = result.stdout.strip()
-            except:
-                version_info = "Unknown version"
-            
-            return {
-                "success": True,
-                "installed": True,
-                "version": version_info,
-                "message": "Echidna is installed and available"
-            }
-        else:
-            install_info = runner.install_echidna()
-            return {
-                "success": False,
-                "installed": False,
-                "message": "Echidna is not installed",
-                "installation_instructions": install_info["instructions"]
-            }
-        
-    except Exception as e:
-        logger.error(f"Error checking Echidna installation: {e}")
-        return {
-            "success": False,
-            "installed": False,
-            "error": str(e),
-            "message": "Error checking Echidna installation"
-        }
-
-@mcp.tool()
-def echidna_auto_install(platform: str = None) -> Dict[str, Any]:
-    """Automatically install Echidna based on detected platform
-    
-    Args:
-        platform: Target platform for installation (optional, auto-detected if not provided)
-                 Supported platforms: ubuntu_debian, macos, fedora, docker, windows
-    """
-    try:
-        runner = EchidnaRunner("/tmp")  
-        
-        if runner._check_echidna_installed():
-            return {
-                "success": True,
-                "installed": True,
-                "message": "Echidna is already installed",
-                "action": "skipped"
-            }
-        
-        logger.info(f"Starting automatic Echidna installation for platform: {platform or 'auto-detect'}")
-        result = runner.auto_install_echidna(platform)
-        
-        result["action"] = "install"
-        result["timestamp"] = time.time()
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error during automatic Echidna installation: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "message": "Failed to install Echidna automatically",
-            "action": "failed",
-            "timestamp": time.time(),
-            "fallback": "Use echidna_check_installation() to get manual installation instructions"
-        }
-
-@mcp.tool()
-def echidna_install_in_project(project_id: str, method: str = "docker") -> Dict[str, Any]:
-    """Install Echidna locally in the project directory
-    
-    Args:
-        project_id: Project identifier
-        method: Installation method - "docker" (recommended) or "binary" (experimental)
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        runner = EchidnaRunner(project.project_path)
-        
-        if method == "docker":
-            result = runner.install_echidna_docker_locally(project.project_path)
-        elif method == "binary":
-            result = runner.install_echidna_locally(project.project_path)
-        else:
-            return {
-                "success": False,
-                "error": f"Unsupported installation method: {method}",
-                "message": "Supported methods: 'docker', 'binary'"
-            }
-        
-        result["project_id"] = project_id
-        result["project_path"] = str(project.project_path)
-        result["method"] = method
-        result["timestamp"] = time.time()
-        
-        return result
-        
-    except Exception as e:
-        logger.error(f"Error installing Echidna in project {project_id}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "project_id": project_id,
-            "message": "Failed to install Echidna in project"
-        }
-
-'''@mcp.tool()
-def echidna_run_tests_local(project_id: str, runs: int = 1000, timeout: int = 300, gas_limit: int = 30000000, contract: str = None, test_mode: str = "property", seed: int = None, verbosity: int = 2, coverage: bool = True, corpus_dir: str = None) -> Dict[str, Any]:
-    """Run Echidna fuzz tests using local installation in project
-    
-    Args:
-        project_id: Project identifier
-        runs: Number of fuzzing runs (default: 1000)
-        timeout: Test timeout in seconds (default: 300)
-        gas_limit: Gas limit for transactions (default: 30000000)
-        contract: Specific contract to test (optional)
-        test_mode: Test mode - "property" or "assertion" (default: "property")
-        seed: Random seed for reproducible results (optional)
-        verbosity: Output verbosity level 0-4 (default: 2)
-        coverage: Enable coverage analysis (default: True)
-        corpus_dir: Directory for corpus files (optional)
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        runner = EchidnaRunner(project.project_path)
-        
-        # Check for local installation
-        project_path = Path(project.project_path)
-        docker_wrapper = project_path / "echidna-docker.sh"
-        binary_path = project_path / "tools" / "echidna" / "echidna"
-        
-        if docker_wrapper.exists():
-            # Use Docker wrapper
-            echidna_command = str(docker_wrapper)
-            installation_method = "docker"
-        elif binary_path.exists():
-            # Use local binary
-            echidna_command = str(binary_path)
-            installation_method = "binary"
-        else:
-            return {
-                "success": False,
-                "error": "No local Echidna installation found",
-                "message": "Please run echidna_install_in_project() first",
-                "project_id": project_id
-            }
-        
-        # Create Echidna configuration
-        config = EchidnaConfig(
-            runs=runs,
-            timeout=timeout,
-            gas_limit=gas_limit,
-            contract=contract,
-            test_mode=test_mode,
-            seed=seed,
-            verbosity=verbosity,
-            coverage=coverage,
-            corpus_dir=corpus_dir
-        )
-        
-        # Run tests with local installation
-        result = runner.run_tests_with_command(config, echidna_command)
-        
-        # Convert EchidnaResult to dictionary and add project context
-        result_dict = result.to_dict()
-        result_dict["project_id"] = project_id
-        result_dict["installation_method"] = installation_method
-        result_dict["echidna_command"] = echidna_command
-        
-        return result_dict
-        
-    except Exception as e:
-        logger.error(f"Error running Echidna tests locally in project {project_id}: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "project_id": project_id,
-            "message": "Failed to run Echidna tests locally"
-        }
-'''
-@mcp.tool()
-def echidna_create_config(
-    project_id: str,
-    runs: int = 1000,
-    timeout: int = 300,
-    gas_limit: int = 30000000,
-    contract: str = None,
-    test_mode: str = "property",
-    seed: int = None,
-    coverage: bool = True,
-    corpus_dir: str = None
-) -> Dict[str, Any]:
-    """Create echidna.yaml configuration file for project
-    
-    Args:
-        project_id: Project identifier
-        runs: Number of fuzzing runs
-        timeout: Test timeout in seconds
-        gas_limit: Gas limit for transactions
-        contract: Specific contract to test
-        test_mode: Test mode - "property" or "assertion"
-        seed: Random seed for reproducible results
-        coverage: Enable coverage analysis
-        corpus_dir: Directory for corpus files
-    """
-    try:
-        project = project_manager.get_project(project_id)
-        if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
-        
-        config = EchidnaConfig(
-            runs=runs,
-            timeout=timeout,
-            gas_limit=gas_limit,
-            contract=contract,
-            test_mode=test_mode,
-            seed=seed,
-            coverage=coverage,
-            corpus_dir=corpus_dir
-        )
-        
-        runner = EchidnaRunner(project.project_path)
-        config_path = runner._create_echidna_config(config)
-        
-        return {
-            "success": True,
-            "project_id": project_id,
-            "config_path": str(config_path.relative_to(project.project_path)),
-            "config": config.to_dict(),
-            "message": f"Created echidna.yaml configuration file"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error creating Echidna config: {e}")
-        return {
-            "success": False,
-            "error": str(e),
-            "project_id": project_id
-        }
-
-@mcp.tool()
-def scenario_stop_local_chain() -> Dict[str, Any]:
-    """Stop local Anvil chain"""
-    try:
-        runner = ScenarioRunner()
-        runner.stop_local_chain()
-        
-        return {
-            "success": True,
-            "message": "Local chain stopped"
-        }
-        
-    except Exception as e:
-        logger.error(f"Error stopping local chain: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
 
 
 

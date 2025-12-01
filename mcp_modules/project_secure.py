@@ -1,6 +1,5 @@
 import subprocess
 import json
-import os
 import shutil
 import tempfile
 import uuid
@@ -10,25 +9,12 @@ from dataclasses import dataclass, asdict
 from enum import Enum
 import logging
 import time
-import mimetypes
 import re
 
 logger = logging.getLogger(__name__)
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_TOTAL_FILES = 1000
-ALLOWED_FILE_EXTENSIONS = {
-    '.sol', '.json', '.toml', '.md', '.txt', '.yaml', '.yml', 
-    '.js', '.ts', '.py', '.sh', '.bat', '.cfg', '.conf', '.ini'
-}
-FORBIDDEN_PATTERNS = [
-    r'\.\./',  # Directory traversal
-    r'\.\.\\',  # Windows directory traversal
-    r'//',     # Multiple slashes
-    r'\\\\',   # Multiple backslashes
-    r'~',      # Home directory
-    r'\$',     # Environment variables
-]
 
 class ProjectType(Enum):
     """Supported project types"""
@@ -40,11 +26,11 @@ class ProjectConfig:
     project_id: str
     project_type: ProjectType
     project_path: str
+    user_id: str = "default"
     solc_version: str = "0.8.19"
     optimization_enabled: bool = True
     optimizer_runs: int = 200
     evm_version: str = "london"
-    auto_cleanup: bool = True
     created_at: float = 0.0
     
     def __post_init__(self):
@@ -58,16 +44,15 @@ class SecurityError(Exception):
     """Custom exception for security violations"""
     pass
 
-class SecurePathValidator:
-    """Secure path validation utilities"""
+class ProjectManager:
+    """Manages temporary projects with Foundry initialization and security"""
     
     @staticmethod
-    def validate_path(requested_path: str, base_path: Path) -> Path:
-        """
-        Validate and sanitize file path to prevent directory traversal attacks
+    def validate_and_resolve_path(requested_path: str, base_path: Path) -> Path:
+        """Validate and resolve file path relative to base_path
         
         Args:
-            requested_path: The requested file path
+            requested_path: The requested file path (relative or absolute)
             base_path: The base directory that paths must be within
             
         Returns:
@@ -76,70 +61,43 @@ class SecurePathValidator:
         Raises:
             SecurityError: If path is invalid or outside allowed directory
         """
-        # Convert to absolute path
         try:
-            abs_path = Path(requested_path).resolve()
+            base_path_resolved = base_path.resolve()
+        except (OSError, ValueError) as e:
+            raise SecurityError(f"Invalid base path: {e}")
+        
+        try:
+            requested_path_obj = Path(requested_path)
+            
+            if requested_path_obj.is_absolute():
+                target_path = requested_path_obj.resolve()
+            else:
+                target_path = (base_path_resolved / requested_path).resolve()
+            
+            try:
+                target_path.relative_to(base_path_resolved)
+            except ValueError:
+                raise SecurityError(f"Path outside allowed directory: {requested_path}")
+            
+            return target_path
+        
         except (OSError, ValueError) as e:
             raise SecurityError(f"Invalid path: {e}")
-        
-        path_str = str(abs_path)
-        for pattern in FORBIDDEN_PATTERNS:
-            if re.search(pattern, path_str):
-                raise SecurityError(f"Forbidden path pattern detected: {pattern}")
-        
-        try:
-            relative_path = abs_path.relative_to(base_path.resolve())
-        except ValueError:
-            raise SecurityError(f"Path outside allowed directory: {requested_path}")
-        
-        return abs_path
     
     @staticmethod
-    def validate_file_extension(file_path: str) -> bool:
-        """Check if file extension is allowed"""
-        ext = Path(file_path).suffix.lower()
-        return ext in ALLOWED_FILE_EXTENSIONS
-    
-    @staticmethod
-    def validate_file_size(content: str) -> bool:
-        """Check if file content size is within limits"""
-        return len(content.encode('utf-8')) <= MAX_FILE_SIZE
-    
-    @staticmethod
-    def validate_file_content(content: str) -> bool:
-        """Basic content validation"""
-        # Check for null bytes
-        if '\x00' in content:
-            return False
+    def validate_file_size(content: str) -> None:
+        """Check if file content size is within limits
         
-        # Check for suspicious patterns
-        suspicious_patterns = [
-            r'<script',  # Potential XSS
-            r'javascript:',  # JavaScript injection
-            r'data:text/html',  # Data URI with HTML
-        ]
-        
-        for pattern in suspicious_patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                return False
-        
-        return True
-    
-    @staticmethod
-    def resolve_symlinks(path: Path) -> Path:
-        """Safely resolve symlinks"""
-        try:
-            return path.resolve()
-        except (OSError, ValueError):
-            return path
-
-class ProjectManager:
-    """Manages temporary projects with Foundry initialization and security"""
+        Raises:
+            SecurityError: If content exceeds MAX_FILE_SIZE
+        """
+        if len(content.encode('utf-8')) > MAX_FILE_SIZE:
+            raise SecurityError("Content too large")
     
     def __init__(self, base_dir: str = None):
         self.base_dir = Path(base_dir) if base_dir else Path(tempfile.gettempdir()) / "mcp_projects"
         self.base_dir.mkdir(exist_ok=True)
-        self.projects: Dict[str, ProjectConfig] = {}
+        self.projects: Dict[str, Dict[str, ProjectConfig]] = {}
         self._load_projects()
     
     def _load_projects(self):
@@ -150,11 +108,27 @@ class ProjectManager:
                 with open(metadata_file, 'r') as f:
                     data = json.load(f)
                 
-                for project_id, project_data in data.items():
-                    project_data['project_type'] = ProjectType(project_data['project_type'])
-                    self.projects[project_id] = ProjectConfig(**project_data)
+                if isinstance(data, dict) and data:
+                    first_key = list(data.keys())[0]
+                    if first_key.startswith('project_') or len(first_key) == 8:
+                        for project_id, project_data in data.items():
+                            project_data['project_type'] = ProjectType(project_data['project_type'])
+                            project_data.pop('auto_cleanup', None)
+                            user_id = project_data.get('user_id', 'default')
+                            if user_id not in self.projects:
+                                self.projects[user_id] = {}
+                            self.projects[user_id][project_id] = ProjectConfig(**project_data)
+                    else:
+                        for user_id, user_projects in data.items():
+                            if user_id not in self.projects:
+                                self.projects[user_id] = {}
+                            for project_id, project_data in user_projects.items():
+                                project_data['project_type'] = ProjectType(project_data['project_type'])
+                                project_data.pop('auto_cleanup', None)
+                                self.projects[user_id][project_id] = ProjectConfig(**project_data)
                 
-                logger.info(f"Loaded {len(self.projects)} existing projects")
+                total_projects = sum(len(projects) for projects in self.projects.values())
+                logger.info(f"Loaded {total_projects} existing projects across {len(self.projects)} users")
             except Exception as e:
                 logger.error(f"Error loading projects metadata: {e}")
                 self.projects = {}
@@ -164,30 +138,43 @@ class ProjectManager:
         metadata_file = self.base_dir / ".projects_metadata.json"
         try:
             data = {}
-            for project_id, project in self.projects.items():
-                project_dict = project.to_dict()
-                project_dict['project_type'] = project.project_type.value
-                data[project_id] = project_dict
+            for user_id, user_projects in self.projects.items():
+                data[user_id] = {}
+                for project_id, project in user_projects.items():
+                    project_dict = project.to_dict()
+                    project_dict['project_type'] = project.project_type.value
+                    data[user_id][project_id] = project_dict
             
             with open(metadata_file, 'w') as f:
                 json.dump(data, f, indent=2)
             
-            logger.info(f"Saved {len(self.projects)} projects metadata")
+            total_projects = sum(len(projects) for projects in self.projects.values())
+            logger.info(f"Saved {total_projects} projects metadata across {len(self.projects)} users")
         except Exception as e:
             logger.error(f"Error saving projects metadata: {e}")
     
     def create_project(
         self,
+        user_id: str = "default",
         project_type: ProjectType = ProjectType.FOUNDRY,
         solc_version: str = "0.8.19",
         optimization_enabled: bool = True,
         optimizer_runs: int = 200,
-        evm_version: str = "london",
-        auto_cleanup: bool = True
+        evm_version: str = "london"
     ) -> ProjectConfig:
-        """Create a new temporary project"""
+        """Create a new temporary project for a specific user"""
+        if not user_id or not isinstance(user_id, str):
+            user_id = "default"
+        
+        user_id = re.sub(r'[^a-zA-Z0-9_-]', '_', user_id)
+        if not user_id:
+            user_id = "default"
+        
+        user_dir = self.base_dir / f"user_{user_id}"
+        user_dir.mkdir(exist_ok=True)
+        
         project_id = str(uuid.uuid4())[:8]
-        project_path = self.base_dir / f"project_{project_id}"
+        project_path = user_dir / f"project_{project_id}"
         
         project_path.mkdir(exist_ok=True)
         
@@ -198,17 +185,19 @@ class ProjectManager:
             project_id=project_id,
             project_type=project_type,
             project_path=str(project_path),
+            user_id=user_id,
             solc_version=solc_version,
             optimization_enabled=optimization_enabled,
             optimizer_runs=optimizer_runs,
-            evm_version=evm_version,
-            auto_cleanup=auto_cleanup
+            evm_version=evm_version
         )
         
-        self.projects[project_id] = config
+        if user_id not in self.projects:
+            self.projects[user_id] = {}
+        self.projects[user_id][project_id] = config
         self._save_projects()
         
-        logger.info(f"Created {project_type} project: {project_id} at {project_path}")
+        logger.info(f"Created {project_type} project: {project_id} for user {user_id} at {project_path}")
         return config
     
     def _init_foundry_project(self, project_path: Path, solc_version: str, optimization_enabled: bool, optimizer_runs: int, evm_version: str):
@@ -309,56 +298,84 @@ class ProjectManager:
         except Exception as e:
             logger.warning(f"Error cleaning up default files: {e}")
     
-    def _is_test_file(self, filename: str, content: str) -> bool:
-        """Determine if a file is a test file"""
-        filename_lower = filename.lower()
+    def get_project(self, project_id: str, user_id: str = "default") -> Optional[ProjectConfig]:
+        """Get project by ID for a specific user"""
+        if user_id not in self.projects:
+            return None
+        return self.projects[user_id].get(project_id)
+    
+    def list_projects(self, user_id: str = None) -> List[ProjectConfig]:
+        """List all projects for a specific user, or all projects if user_id is None"""
+        if user_id:
+            return list(self.projects.get(user_id, {}).values())
+        else:
+            all_projects = []
+            for user_projects in self.projects.values():
+                all_projects.extend(user_projects.values())
+            return all_projects
+    
+    def write_deployment_script(
+        self,
+        project_id: str,
+        user_id: str,
+        script_content: str,
+        script_path: str = "script/Deploy.s.sol"
+    ) -> Dict[str, Any]:
+        """Write deployment script content to file
         
-        test_patterns = [
-            '.t.sol',  # Foundry test pattern
-            'test_',   # Test prefix
-            '_test.sol',  # Test suffix
-            'test/',   # Test directory
-            'tests/'   # Tests directory
-        ]
+        Args:
+            project_id: Project identifier
+            user_id: User identifier
+            script_content: Solidity code for the deployment script
+            script_path: Relative path to script file (default: script/Deploy.s.sol)
+        """
+        project = self.get_project(project_id, user_id)
+        if not project:
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         
-        for pattern in test_patterns:
-            if pattern in filename_lower:
-                return True
+        project_path = Path(project.project_path)
         
-        if filename_lower.endswith('test.sol'):
-            return True
+        try:
+            validated_path = self.validate_and_resolve_path(script_path, project_path)
+            validated_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(validated_path, 'w', encoding='utf-8') as f:
+                f.write(script_content)
+            
+            logger.info(f"Wrote deployment script to {validated_path.relative_to(project_path)}")
+            
+            return {
+                "success": True,
+                "script_path": script_path,
+                "absolute_path": str(validated_path),
+                "message": f"Deployment script written to {script_path}"
+            }
         
-        content_lower = content.lower()
-        test_content_patterns = [
-            'import {test}',
-            'import {console}',
-            'contract test',
-            'function test',
-            'is test',
-            'forge-std/test'
-        ]
-        
-        for pattern in test_content_patterns:
-            if pattern in content_lower:
-                return True
-        
-        return False
-
-    def add_files(self, project_id: str, files: Dict[str, str]) -> Dict[str, Any]:
-        """Add multiple files to project with security validation
+        except SecurityError as e:
+            return {"success": False, "error": f"Path validation failed: {e}"}
+        except Exception as e:
+            logger.error(f"Error writing deployment script: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def write_validated_files(
+        self,
+        project_id: str,
+        files: Dict[str, str],
+        user_id: str = "default"
+    ) -> Dict[str, Any]:
+        """Write multiple files to project with security validation
         
         Args:
             project_id: Project identifier
             files: Dictionary where keys are file paths (can include subdirectories) 
                    and values are file contents
+            user_id: User identifier
         """
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
+        project = self.get_project(project_id, user_id)
+        if not project:
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         project_path = Path(project.project_path)
         
-        # Security validation
         if len(files) > MAX_TOTAL_FILES:
             return {"success": False, "error": f"Too many files. Maximum allowed: {MAX_TOTAL_FILES}"}
         
@@ -366,84 +383,23 @@ class ProjectManager:
         errors = []
         
         for file_path_str, content in files.items():
-            try:
-                # Security validations
-                if not SecurePathValidator.validate_file_extension(file_path_str):
-                    errors.append(f"File extension not allowed: {file_path_str}")
-                    continue
-                
-                if not SecurePathValidator.validate_file_size(content):
-                    errors.append(f"File too large: {file_path_str}")
-                    continue
-                
-                if not SecurePathValidator.validate_file_content(content):
-                    errors.append(f"File content validation failed: {file_path_str}")
-                    continue
-                
-                # Validate and resolve path
-                try:
-                    validated_path = SecurePathValidator.validate_path(file_path_str, project_path)
-                except SecurityError as e:
-                    errors.append(f"Path validation failed: {e}")
-                    continue
-                
-                file_path_obj = Path(file_path_str)
-                
-                # Determine target directory
-                if file_path_obj.parts[0] in ['test', 'tests']:
-                    target_dir = project_path / file_path_obj.parent
-                elif file_path_obj.parts[0] in ['script', 'scripts']:
-                    target_dir = project_path / file_path_obj.parent
-                elif file_path_obj.parts[0] in ['src', 'source']:
-                    target_dir = project_path / file_path_obj.parent
-                elif file_path_obj.name == 'foundry.toml':
-                    target_dir = project_path
-                elif self._is_test_file(file_path_str, content):
-                    target_dir = project_path / "test"
-                elif file_path_str.endswith('.sol'):
-                    target_dir = project_path / "src"
-                elif file_path_str.endswith('.s.sol'):
-                    target_dir = project_path / "script"
-                elif file_path_str.endswith('.t.sol'):
-                    target_dir = project_path / "test"
-                else:
-                    target_dir = project_path 
-                
-                target_dir.mkdir(exist_ok=True, parents=True)
-                
-                if len(file_path_obj.parts) > 1 and file_path_obj.parts[0] not in ['test', 'tests', 'script', 'scripts', 'src', 'source']:
-                    full_target_dir = project_path / file_path_obj.parent
-                    full_target_dir.mkdir(exist_ok=True, parents=True)
-                    final_file_path = full_target_dir / file_path_obj.name
-                else:
-                    final_file_path = target_dir / file_path_obj.name
-                
-                # Final security check - ensure final path is within project
-                try:
-                    final_file_path.resolve().relative_to(project_path.resolve())
-                except ValueError:
-                    errors.append(f"Final file path outside project directory: {final_file_path}")
-                    continue
-                
-                with open(final_file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                
+            result = self._write_validated_file(
+                project_id, user_id, file_path_str, content, must_exist=False
+            )
+            
+            if result["success"]:
                 file_info = {
-                    "filename": file_path_obj.name,
-                    "content": content,
-                    "path": str(final_file_path.relative_to(project_path)),
+                    "filename": Path(file_path_str).name,
+                    "path": file_path_str,
+                    "absolute_path": result.get("absolute_path", ""),
                     "original_path": file_path_str,
-                    "size": len(content.encode('utf-8')),
+                    "size": result.get("file_size", len(content.encode('utf-8'))),
                     "created_at": time.time()
                 }
-                
                 added_files.append(file_info)
-                
-                file_type = "test" if self._is_test_file(file_path_str, content) else "file"
-                logger.info(f"Added {file_type} {file_path_obj.name} to project {project_id} at {final_file_path.relative_to(project_path)}")
-                
-            except Exception as e:
-                error_msg = f"Failed to add {file_path_str}: {str(e)}"
+                logger.info(f"Added file {file_path_str} to project {project_id}")
+            else:
+                error_msg = f"Failed to add {file_path_str}: {result.get('error', 'Unknown error')}"
                 errors.append(error_msg)
                 logger.error(error_msg)
         
@@ -456,484 +412,75 @@ class ProjectManager:
             "message": f"Added {len(added_files)}/{len(files)} files to project"
         }
     
-    def get_project(self, project_id: str) -> Optional[ProjectConfig]:
-        """Get project by ID"""
-        return self.projects.get(project_id)
-    
-    def list_projects(self) -> List[ProjectConfig]:
-        """List all projects"""
-        return list(self.projects.values())
-    
-    def compile_project(self, project_id: str) -> Dict[str, Any]:
-        """Compile project using BuildManager"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
-        project_path = Path(project.project_path)
-        
-        try:
-            from .build import BuildManager, BuildConfig, BuildToolchain
-            build_manager = BuildManager(str(project_path))
-            
-            toolchain_map = {
-                ProjectType.FOUNDRY: BuildToolchain.FOUNDRY
-            }
-            
-            config = BuildConfig(
-                toolchain=BuildToolchain.FOUNDRY,
-                solc_version=project.solc_version,
-                source_dir="src",
-                output_dir="out",
-                optimization_enabled=project.optimization_enabled,
-                optimizer_runs=project.optimizer_runs,
-                evm_version=project.evm_version
-            )
-            
-            result = build_manager.compile(config)
-            
-            return {
-                "success": result.success,
-                "artifacts": [artifact for artifact in result.artifacts],
-                "compilation_time": result.compilation_time,
-                "errors": result.errors,
-                "warnings": result.warnings,
-                "project_type": project.project_type.value
-            }
-        
-        except Exception as e:
-            logger.error(f"Error compiling project {project_id}: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def deploy_project(
-        self,
-        project_id: str,
-        script_path: str = None,
-        rpc_url: str = "http://localhost:8545",
-        private_key: str = None,
-        deployment_requirements: str = None,
-        generate_script: bool = True,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """Deploy project contracts using DeployManager with optional smart script generation"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
-        project_path = Path(project.project_path)
-        
-        try:
-            artifacts = None
-            if generate_script and not script_path:
-                compile_result = self.compile_project(project_id)
-                if compile_result.get("success", False):
-                    artifacts = compile_result.get("artifacts", [])
-                    logger.info(f"Using {len(artifacts)} artifacts for script generation")
-                else:
-                    logger.warning("Compilation failed, using basic deployment script")
-            
-            if not script_path:
-                script_path = self._create_deployment_script(
-                    project_path, 
-                    artifacts=artifacts,
-                    deployment_requirements=deployment_requirements
-                )
-            
-            return {
-                "success": True,
-                "script_path": script_path,
-                "script_generated": generate_script and not script_path,
-                "artifacts_used": len(artifacts) if artifacts else 0,
-                "message": "Deployment script generated successfully"
-            }
-        
-        except Exception as e:
-            logger.error(f"Error deploying project {project_id}: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def _analyze_artifacts_for_deployment(self, artifacts: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Analyze compilation artifacts to extract deployment information"""
-        contract_info = {}
-        
-        for artifact in artifacts:
-            contract_name = artifact.get('name', 'Unknown')
-            abi = artifact.get('abi', [])
-            
-            constructor_params = []
-            for item in abi:
-                if item.get('type') == 'constructor':
-                    constructor_params = item.get('inputs', [])
-                    break
-            
-            functions = []
-            for item in abi:
-                if item.get('type') == 'function':
-                    functions.append({
-                        'name': item.get('name', ''),
-                        'inputs': item.get('inputs', []),
-                        'stateMutability': item.get('stateMutability', 'nonpayable')
-                    })
-            
-            contract_info[contract_name] = {
-                'constructor_params': constructor_params,
-                'functions': functions,
-                'abi': abi,
-                'bytecode': artifact.get('bytecode', ''),
-                'path': artifact.get('path', '')
-            }
-        
-        return contract_info
-    
-    def _generate_deployment_script_with_llm(self, artifacts: List[Dict[str, Any]], 
-                                           deployment_requirements: str = None, solc_version: str = "0.8.19") -> str:
-        """Generate deployment script using LLM agent based on artifacts"""
-        try:
-            contract_info = self._analyze_artifacts_for_deployment(artifacts)
-            
-            prompt = self._create_deployment_prompt(contract_info, deployment_requirements)
-    
-            return self._generate_smart_deployment_template(contract_info, deployment_requirements, solc_version)
-            
-        except Exception as e:
-            logger.error(f"Error generating deployment script with LLM: {e}")
-            return self._create_basic_deployment_template(solc_version)
-    
-    def _create_deployment_prompt(self, contract_info: Dict[str, Any], 
-                                deployment_requirements: str = None) -> str:
-        """Create prompt for LLM agent to generate deployment script"""
-        prompt = f"""Generate a Foundry deployment script for the following contracts:
-
-        Contract Information:
-        """
-        
-        for contract_name, info in contract_info.items():
-            prompt += f"\nContract: {contract_name}\n"
-            prompt += f"Constructor Parameters: {info['constructor_params']}\n"
-            prompt += f"Available Functions: {[f['name'] for f in info['functions']]}\n"
-        
-        if deployment_requirements:
-            prompt += f"\nDeployment Requirements: {deployment_requirements}\n"
-        
-        prompt += """
-            Please generate a complete Foundry deployment script that:
-            1. Imports necessary dependencies
-            2. Deploys all contracts with appropriate constructor parameters
-            3. Includes any necessary initialization calls
-            4. Uses proper Foundry script structure with vm.startBroadcast() and vm.stopBroadcast()
-            5. Includes console logging for deployed addresses
-
-            Return only the Solidity code without explanations.
-        """
-        
-        return prompt
-    
-    def _generate_smart_deployment_template(self, contract_info: Dict[str, Any], 
-                                          deployment_requirements: str = None, solc_version: str = "0.8.19") -> str:
-        """Generate smart deployment template based on artifacts analysis"""
-        
-        script_content = f"""// SPDX-License-Identifier: MIT
-            pragma solidity ^{solc_version};
-
-            import {{Script, console}} from "forge-std/Script.sol";
-        """
-        
-        for contract_name in contract_info.keys():
-            script_content += f'import {{{contract_name}}} from "../src/{contract_name}.sol";\n'
-        
-        script_content += """
-        contract DeployScript is Script {
-            function setUp() public {}
-
-            function run() public {
-                vm.startBroadcast();
-                
-                console.log("Starting deployment...");
-        """
-        
-        for contract_name, info in contract_info.items():
-            constructor_params = info['constructor_params']
-            
-            if constructor_params:
-                param_names = [param['name'] for param in constructor_params]
-                param_types = [param['type'] for param in constructor_params]
-                
-                script_content += f"""
-                    // Deploy {contract_name}
-                    console.log("Deploying {contract_name}...");
-                    {contract_name} {contract_name.lower()} = new {contract_name}("""
-                            
-                for i, (name, param_type) in enumerate(zip(param_names, param_types)):
-                    default_value = self._get_default_value_for_type(param_type)
-                    if i > 0:
-                        script_content += ", "
-                    script_content += default_value
-                
-                script_content += f""");
-                    console.log("{contract_name} deployed at:", address({contract_name.lower()}));
-                """
-            else:
-                script_content += f"""
-                    // Deploy {contract_name}
-                    console.log("Deploying {contract_name}...");
-                    {contract_name} {contract_name.lower()} = new {contract_name}();
-                    console.log("{contract_name} deployed at:", address({contract_name.lower()}));
-            """
-                    
-        script_content += """
-                vm.stopBroadcast();
-                console.log("Deployment completed!");
-            }
-        }"""
-                
-        return script_content
-    
-    def _get_default_value_for_type(self, param_type: str) -> str:
-        """Get default value for Solidity type"""
-        type_mapping = {
-            'address': 'address(0)',
-            'uint256': '0',
-            'uint128': '0',
-            'uint64': '0',
-            'uint32': '0',
-            'uint8': '0',
-            'int256': '0',
-            'int128': '0',
-            'int64': '0',
-            'int32': '0',
-            'int8': '0',
-            'bool': 'false',
-            'string': '""',
-            'bytes': '""',
-            'bytes32': 'bytes32(0)',
-            'bytes16': 'bytes16(0)',
-            'bytes8': 'bytes8(0)',
-            'bytes4': 'bytes4(0)',
-            'bytes2': 'bytes2(0)',
-            'bytes1': 'bytes1(0)'
-        }
-        
-        if '[]' in param_type:
-            return '[]'
-        
-        if 'mapping' in param_type:
-            return 'mapping()'
-        
-        return type_mapping.get(param_type, '0')
-    
-    def _create_basic_deployment_template(self, solc_version: str = "0.8.19") -> str:
-        """Create basic deployment template as fallback"""
-        return f"""// SPDX-License-Identifier: MIT
-        pragma solidity ^{solc_version};
-
-        import {{Script, console}} from "forge-std/Script.sol";
-
-        contract DeployScript is Script {{
-            function setUp() public {{}}
-
-            function run() public {{
-                vm.startBroadcast();
-                
-                console.log("Starting deployment...");
-                
-                // Deploy contracts here
-                // Example: MyContract myContract = new MyContract();
-                
-                vm.stopBroadcast();
-                console.log("Deployment completed!");
-            }}
-        }}"""
-
-    def _create_deployment_script(self, project_path: Path, artifacts: List[Dict[str, Any]] = None, 
-                                deployment_requirements: str = None, solc_version: str = "0.8.19") -> str:
-        """Create deployment script with optional LLM generation"""
-        script_dir = project_path / "script"
-        script_dir.mkdir(exist_ok=True)
-        
-        if artifacts and len(artifacts) > 0:
-            script_content = self._generate_deployment_script_with_llm(artifacts, deployment_requirements, solc_version)
-        else:
-            script_content = self._create_basic_deployment_template(solc_version)
-        
-        script_path = script_dir / "Deploy.s.sol"
-        with open(script_path, 'w') as f:
-            f.write(script_content)
-        
-        logger.info(f"Generated deployment script at {script_path}")
-        return str(script_path.relative_to(project_path))
-    
-    def cleanup_project(self, project_id: str) -> bool:
-        """Clean up project directory"""
-        if project_id not in self.projects:
+    def cleanup_project(self, project_id: str, user_id: str = "default") -> bool:
+        """Clean up project directory and runtime objects"""
+        project = self.get_project(project_id, user_id)
+        if not project:
             return False
-        
-        project = self.projects[project_id]
         project_path = Path(project.project_path)
         
         try:
+            from .chain import stop_project_anvil
+            try:
+                stop_project_anvil(project_id, user_id)
+            except Exception as e:
+                logger.warning(f"Error stopping Anvil during cleanup: {e}")
+            
             if project_path.exists():
                 shutil.rmtree(project_path)
             
-            del self.projects[project_id]
+            if user_id in self.projects and project_id in self.projects[user_id]:
+                del self.projects[user_id][project_id]
+                if not self.projects[user_id]:
+                    del self.projects[user_id]
             self._save_projects()
             
-            logger.info(f"Cleaned up project {project_id}")
+            logger.info(f"Cleaned up project {project_id} for user {user_id}")
             return True
         
         except Exception as e:
             logger.error(f"Error cleaning up project {project_id}: {e}")
             return False
     
-    def cleanup_all_projects(self):
-        """Clean up all projects"""
-        for project_id in list(self.projects.keys()):
-            self.cleanup_project(project_id)
-        
-        logger.info("Cleaned up all projects")
+    def cleanup_all_projects(self, user_id: str = None):
+        """Clean up all projects for a specific user, or all projects if user_id is None"""
+        if user_id:
+            if user_id in self.projects:
+                for project_id in list(self.projects[user_id].keys()):
+                    self.cleanup_project(project_id, user_id)
+                logger.info(f"Cleaned up all projects for user {user_id}")
+        else:
+            for user_id_key in list(self.projects.keys()):
+                for project_id in list(self.projects[user_id_key].keys()):
+                    self.cleanup_project(project_id, user_id_key)
+            logger.info("Cleaned up all projects for all users")
     
-    def cleanup_old_projects(self, max_age_hours: int = 24):
-        """Clean up projects older than specified hours"""
+    def cleanup_old_projects(self, max_age_hours: int = 24, user_id: str = None):
+        """Clean up projects older than specified hours for a specific user, or all users if user_id is None"""
         current_time = time.time()
         max_age_seconds = max_age_hours * 3600
         
         old_projects = []
-        for project_id, project in self.projects.items():
-            if current_time - project.created_at > max_age_seconds:
-                old_projects.append(project_id)
+        users_to_check = [user_id] if user_id else list(self.projects.keys())
         
-        for project_id in old_projects:
-            self.cleanup_project(project_id)
+        for user_id_key in users_to_check:
+            if user_id_key not in self.projects:
+                continue
+            for project_id, project in self.projects[user_id_key].items():
+                if current_time - project.created_at > max_age_seconds:
+                    old_projects.append((project_id, user_id_key))
+        
+        for project_id, user_id_key in old_projects:
+            self.cleanup_project(project_id, user_id_key)
         
         logger.info(f"Cleaned up {len(old_projects)} old projects")
         return len(old_projects)
     
-    def get_project_managers(self, project_id: str) -> Dict[str, Any]:
-        """Get BuildManager, DeployManager, and AnvilWrapper for specific project"""
-        if project_id not in self.projects:
-            return {"error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
-        project_path = Path(project.project_path)
-        
-        try:
-            from .build import BuildManager, BuildConfig, BuildToolchain
-            from .deploy import DeployManager, DeployConfig, TransactionType
-            from .chain import AnvilWrapper, AnvilConfig, AnvilMode
-            
-            build_manager = BuildManager(str(project_path))
-            deploy_manager = DeployManager(str(project_path))
-            
-            anvil_config = AnvilConfig(
-                mode=AnvilMode.DEVNET,
-                port=8545 + hash(project_id) % 1000,  
-                chain_id=31337 + hash(project_id) % 1000 
-            )
-            anvil_wrapper = AnvilWrapper(anvil_config)
-            
-            build_config = BuildConfig(
-                toolchain=BuildToolchain.FOUNDRY,
-                solc_version=project.solc_version,
-                source_dir="src",
-                output_dir="out",
-                optimization_enabled=project.optimization_enabled,
-                optimizer_runs=project.optimizer_runs,
-                evm_version=project.evm_version
-            )
-            
-            return {
-                "project": project.to_dict(),
-                "build_manager": build_manager,
-                "deploy_manager": deploy_manager,
-                "anvil_wrapper": anvil_wrapper,
-                "build_config": build_config,
-                "project_path": str(project_path)
-            }
-        
-        except Exception as e:
-            logger.error(f"Error getting project managers: {e}")
-            return {"error": str(e)}
-    
-    def start_project_anvil(self, project_id: str) -> Dict[str, Any]:
-        """Start Anvil instance for specific project"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
-        
-        try:
-            from .chain import AnvilWrapper, AnvilConfig, AnvilMode
-            
-            anvil_config = AnvilConfig(
-                mode=AnvilMode.DEVNET,
-                port=8545 + hash(project_id) % 1000,  
-                chain_id=31337 + hash(project_id) % 1000 
-            )
-            anvil_wrapper = AnvilWrapper(anvil_config)
-            
-            if anvil_wrapper.start():
-                project.metadata = getattr(project, 'metadata', {})
-                project.metadata['anvil_wrapper'] = anvil_wrapper
-                project.metadata['anvil_port'] = anvil_wrapper.config.port
-                project.metadata['anvil_chain_id'] = anvil_wrapper.config.chain_id
-                
-                return {
-                    "success": True,
-                    "anvil_port": anvil_wrapper.config.port,
-                    "anvil_chain_id": anvil_wrapper.config.chain_id,
-                    "rpc_url": f"http://localhost:{anvil_wrapper.config.port}",
-                    "message": f"Anvil started for project {project_id}"
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "Failed to start Anvil"
-                }
-        
-        except Exception as e:
-            logger.error(f"Error starting Anvil for project {project_id}: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-    
-    def stop_project_anvil(self, project_id: str) -> Dict[str, Any]:
-        """Stop Anvil instance for specific project"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
-        
-        try:
-            if hasattr(project, 'metadata') and 'anvil_wrapper' in project.metadata:
-                anvil_wrapper = project.metadata['anvil_wrapper']
-                anvil_wrapper.stop()
-                
-                project.metadata.pop('anvil_wrapper', None)
-                project.metadata.pop('anvil_port', None)
-                project.metadata.pop('anvil_chain_id', None)
-                
-                return {
-                    "success": True,
-                    "message": f"Anvil stopped for project {project_id}"
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": "No Anvil instance found for this project"
-                }
-        
-        except Exception as e:
-            logger.error(f"Error stopping Anvil for project {project_id}: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-    
-    def install_dependency(self, project_id: str, dependency_url: str, branch: str = None) -> Dict[str, Any]:
+    def install_dependency(self, project_id: str, dependency_url: str, user_id: str = "default", branch: str = None) -> Dict[str, Any]:
         """Install external dependency using forge install"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
+        project = self.get_project(project_id, user_id)
+        if not project:
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         project_path = Path(project.project_path)
         
         
@@ -957,19 +504,6 @@ class ProjectManager:
             )
             
             if result.returncode == 0:
-                if not hasattr(project, 'metadata'):
-                    project.metadata = {}
-                if 'dependencies' not in project.metadata:
-                    project.metadata['dependencies'] = []
-                
-                dependency_info = {
-                    'url': dependency_url,
-                    'branch': branch,
-                    'installed_at': time.time()
-                }
-                project.metadata['dependencies'].append(dependency_info)
-                self._save_projects()
-                
                 logger.info(f"Successfully installed dependency: {dependency_url}")
                 return {
                     "success": True,
@@ -992,62 +526,22 @@ class ProjectManager:
             logger.error(f"Error installing dependency: {e}")
             return {"success": False, "error": str(e)}
     
-    def install_multiple_dependencies(self, project_id: str, dependencies: List[Dict[str, str]]) -> Dict[str, Any]:
-        """Install multiple dependencies at once"""
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        results = []
-        successful_installs = 0
-        
-        for dep in dependencies:
-            url = dep.get('url')
-            branch = dep.get('branch')
-            
-            if not url:
-                results.append({
-                    "dependency": dep,
-                    "success": False,
-                    "error": "Missing dependency URL"
-                })
-                continue
-            
-            result = self.install_dependency(project_id, url, branch)
-            results.append({
-                "dependency": dep,
-                "success": result["success"],
-                "error": result.get("error"),
-                "output": result.get("output")
-            })
-            
-            if result["success"]:
-                successful_installs += 1
-        
-        return {
-            "success": successful_installs > 0,
-            "total_dependencies": len(dependencies),
-            "successful_installs": successful_installs,
-            "failed_installs": len(dependencies) - successful_installs,
-            "results": results
-        }
-    
-    def get_file_content(self, project_id: str, file_path: str) -> Dict[str, Any]:
+    def get_file_content(self, project_id: str, file_path: str, user_id: str = "default") -> Dict[str, Any]:
         """Get content of any file from project directory with security validation
         
         Args:
             project_id: Project identifier
             file_path: Path to file relative to project root (e.g., "src/Contract.sol", "test/Test.t.sol")
+            user_id: User identifier
         """
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
+        project = self.get_project(project_id, user_id)
+        if not project:
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         project_path = Path(project.project_path)
         
         try:
-            # Security validation
             try:
-                validated_path = SecurePathValidator.validate_path(file_path, project_path)
+                validated_path = self.validate_and_resolve_path(file_path, project_path)
             except SecurityError as e:
                 return {"success": False, "error": str(e)}
             
@@ -1094,25 +588,24 @@ class ProjectManager:
                 "error": str(e)
             }
     
-    def list_project_files(self, project_id: str, directory: str = None, file_pattern: str = None) -> Dict[str, Any]:
+    def list_project_files(self, project_id: str, user_id: str = "default", directory: str = None, file_pattern: str = None) -> Dict[str, Any]:
         """List files in project directory with security validation
         
         Args:
             project_id: Project identifier
+            user_id: User identifier
             directory: Subdirectory to list (e.g., "src", "test", "script"). If None, lists root directory
             file_pattern: File pattern to filter (e.g., "*.sol", "*.t.sol"). If None, lists all files
         """
-        if project_id not in self.projects:
-            return {"success": False, "error": f"Project {project_id} not found"}
-        
-        project = self.projects[project_id]
+        project = self.get_project(project_id, user_id)
+        if not project:
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         project_path = Path(project.project_path)
         
         try:
             if directory:
-                # Security validation for directory path
                 try:
-                    validated_dir = SecurePathValidator.validate_path(directory, project_path)
+                    validated_dir = self.validate_and_resolve_path(directory, project_path)
                 except SecurityError as e:
                     return {"success": False, "error": str(e)}
                 
@@ -1137,7 +630,6 @@ class ProjectManager:
             
             for item in target_dir.iterdir():
                 try:
-                    # Ensure item is within project directory
                     item.resolve().relative_to(project_path.resolve())
                 except ValueError:
                     continue  # Skip items outside project directory
@@ -1183,252 +675,107 @@ class ProjectManager:
                 "error": str(e)
             }
 
-def generate_deployment_script(project_id: str, deployment_requirements: str = None) -> Dict[str, Any]:
-    """Generate deployment script for project based on artifacts"""
-    if project_id not in _project_manager.projects:
-        return {"success": False, "error": f"Project {project_id} not found"}
-    
-    try:
-        compile_result = _project_manager.compile_project(project_id)
-        if not compile_result.get("success", False):
-            return {"success": False, "error": "Project compilation failed"}
+    def apply_file_modifications(self, content: str, modifications: Dict[str, Any]) -> str:
+        """Apply file modifications - simplified to only replace_all_content
         
-        artifacts = compile_result.get("artifacts", [])
-        if not artifacts:
-            return {"success": False, "error": "No artifacts found for script generation"}
+        This method supports ONLY "replace_all_content" modification type.
+        Any other modification types in the `modifications` dict are ignored
+        (this is intentional, not a bug).
         
-        project = _project_manager.projects[project_id]
-        project_path = Path(project.project_path)
+        Agent responsibility:
+        - Read the file content
+        - Compute the diff and generate new content
+        - Call this method with "replace_all_content" to validate and replace
         
-        script_path = _project_manager._create_deployment_script(
-            project_path,
-            artifacts=artifacts,
-            deployment_requirements=deployment_requirements,
-            solc_version=project.solc_version
-        )
+        This method only performs:
+        - Security validation (file size limits)
+        - Content replacement
         
-        return {
-            "success": True,
-            "script_path": script_path,
-            "artifacts_analyzed": len(artifacts),
-            "contracts": [artifact.get('name', 'Unknown') for artifact in artifacts]
-        }
+        Args:
+            content: Original file content
+            modifications: Dict with optional "replace_all_content" key containing
+                          {"new_content": str}. All other keys are ignored.
         
-    except Exception as e:
-        logger.error(f"Error generating deployment script: {e}")
-        return {"success": False, "error": str(e)}
-
-
-def apply_file_modifications(content: str, modifications: Dict[str, Any]) -> str:
-    """Apply specific modifications to file content with security validation"""
-    modified_content = content
-    
-    # Security validation
-    if not SecurePathValidator.validate_file_content(modified_content):
-        raise SecurityError("File content validation failed")
-    
-    # Modification types
-    for modification_type, modification_data in modifications.items():
-        if modification_type == "replace_all_content":
-            # Replace entire file content
-            new_content = modification_data.get("new_content")
+        Returns:
+            Modified content (or original if no replace_all_content provided)
+        
+        Raises:
+            SecurityError: If new content exceeds size limits
+        """
+        modified_content = content
+        
+        if "replace_all_content" in modifications:
+            new_content = modifications["replace_all_content"].get("new_content")
             if new_content is not None:
-                # Validate new content before replacing
-                if not SecurePathValidator.validate_file_content(new_content):
-                    raise SecurityError("New content validation failed")
-                if not SecurePathValidator.validate_file_size(new_content):
-                    raise SecurityError("New content too large")
+                self.validate_file_size(new_content)
                 modified_content = new_content
         
-        elif modification_type == "replace_text":
-            # Replace specific text
-            old_text = modification_data.get("old_text")
-            new_text = modification_data.get("new_text")
-            if old_text and new_text is not None:
-                modified_content = modified_content.replace(old_text, new_text)
+        self.validate_file_size(modified_content)
         
-        elif modification_type == "find" and "replace" in modifications:
-            find_text = modification_data
-            replace_text = modifications.get("replace")
-            all_occurrences = modifications.get("all_occurrences", False)
-            
-            if find_text and replace_text is not None:
-                if all_occurrences:
-                    modified_content = modified_content.replace(find_text, replace_text)
-                else:
-                    modified_content = modified_content.replace(find_text, replace_text, 1)
-        
-        elif modification_type == "replace_line":
-            line_number = modification_data.get("line_number")
-            new_line = modification_data.get("new_line")
-            if line_number is not None and new_line is not None:
-                lines = modified_content.split('\n')
-                if 0 <= line_number < len(lines):
-                    lines[line_number] = new_line
-                    modified_content = '\n'.join(lines)
-        
-        elif modification_type == "insert_line":
-            line_number = modification_data.get("line_number")
-            new_line = modification_data.get("new_line")
-            if line_number is not None and new_line is not None:
-                lines = modified_content.split('\n')
-                lines.insert(line_number, new_line)
-                modified_content = '\n'.join(lines)
-        
-        elif modification_type == "delete_line":
-            line_number = modification_data.get("line_number")
-            if line_number is not None:
-                lines = modified_content.split('\n')
-                if 0 <= line_number < len(lines):
-                    lines.pop(line_number)
-                    modified_content = '\n'.join(lines)
-        
-        elif modification_type == "replace_regex":
-            pattern = modification_data.get("pattern")
-            replacement = modification_data.get("replacement")
-            if pattern and replacement is not None:
-                import re
-                modified_content = re.sub(pattern, replacement, modified_content)
-        
-        elif modification_type == "replace_between_markers":
-            start_marker = modification_data.get("start_marker")
-            end_marker = modification_data.get("end_marker")
-            new_content = modification_data.get("new_content")
-            if start_marker and end_marker and new_content is not None:
-                start_index = modified_content.find(start_marker)
-                end_index = modified_content.find(end_marker)
-                if start_index >= 0 and end_index >= 0 and end_index > start_index:
-                    modified_content = (
-                        modified_content[:start_index] +
-                        start_marker + new_content + end_marker +
-                        modified_content[end_index + len(end_marker):]
-                    )
-        
-        elif modification_type == "add_import":
-            import_statement = modification_data.get("import_statement")
-            if import_statement:
-                lines = modified_content.split('\n')
-                last_import_index = -1
-                for i, line in enumerate(lines):
-                    if line.strip().startswith('import '):
-                        last_import_index = i
-                
-                if last_import_index >= 0:
-                    lines.insert(last_import_index + 1, import_statement)
-                    modified_content = '\n'.join(lines)
-                else:
-                    pragma_index = -1
-                    for i, line in enumerate(lines):
-                        if line.strip().startswith('pragma '):
-                            pragma_index = i
-                            break
-                    
-                    if pragma_index >= 0:
-                        lines.insert(pragma_index + 1, import_statement)
-                        lines.insert(pragma_index + 2, "")  
-                        modified_content = '\n'.join(lines)
-        
-        elif modification_type == "add_function":
-            function_code = modification_data.get("function_code")
-            if function_code:
-                lines = modified_content.split('\n')
-                for i in range(len(lines) - 1, -1, -1):
-                    if lines[i].strip() == '}':
-                        lines.insert(i, function_code)
-                        break
-                modified_content = '\n'.join(lines)
-        
-        elif modification_type == "replace_function":
-            function_name = modification_data.get("function_name")
-            new_function_code = modification_data.get("new_function_code")
-            if function_name and new_function_code:
-                import re
-                pattern = rf'function\s+{function_name}\s*\([^)]*\)\s*[^{{]*\{{[^}}]*\}}'
-                modified_content = re.sub(pattern, new_function_code, modified_content, flags=re.DOTALL)
+        return modified_content
     
-    # Final security validation
-    if not SecurePathValidator.validate_file_content(modified_content):
-        raise SecurityError("Modified content validation failed")
-    
-    return modified_content
-
-
-def analyze_contract_artifacts(project_id: str) -> Dict[str, Any]:
-    """Analyze contract artifacts for deployment information"""
-    try:
-        project_manager = get_project_manager()
-        project = project_manager.get_project(project_id)
+    def _write_validated_file(
+        self,
+        project_id: str,
+        user_id: str,
+        file_path: str,
+        content: str,
+        must_exist: bool = False
+    ) -> Dict[str, Any]:
+        """Internal helper to write file content with validation
         
+        Args:
+            project_id: Project identifier
+            user_id: User identifier
+            file_path: Path to file relative to project root
+            content: File content to write
+            must_exist: If True, file must exist (for modification). If False, file can be created.
+        
+        Returns:
+            Dict with success status and file information or error
+        """
+        project = self.get_project(project_id, user_id)
         if not project:
-            return {
-                "success": False,
-                "error": f"Project {project_id} not found"
-            }
+            return {"success": False, "error": f"Project {project_id} not found for user {user_id}"}
         
-        artifacts = project.get_artifacts()
+        project_path = Path(project.project_path)
         
-        if not artifacts:
-            return {
-                "success": False,
-                "error": "No artifacts found in project"
-            }
+        try:
+            validated_path = self.validate_and_resolve_path(file_path, project_path)
+        except SecurityError as e:
+            return {"success": False, "error": f"Security validation failed: {e}"}
+        except Exception as e:
+            return {"success": False, "error": f"Path validation error: {e}"}
         
-        contract_info = {}
-        total_contracts = 0
+        if must_exist:
+            if not validated_path.exists():
+                return {"success": False, "error": f"File {file_path} not found in project"}
+            if validated_path.is_dir():
+                return {"success": False, "error": f"Path {file_path} is a directory, not a file"}
         
-        for artifact in artifacts:
-            contract_name = artifact.get('name', 'Unknown')
-            abi = artifact.get('abi', [])
-            
-            constructor_params = []
-            for item in abi:
-                if item.get('type') == 'constructor':
-                    constructor_params = item.get('inputs', [])
-                    break
-            
-            functions = []
-            for item in abi:
-                if item.get('type') == 'function':
-                    functions.append({
-                        'name': item.get('name', ''),
-                        'inputs': item.get('inputs', []),
-                        'stateMutability': item.get('stateMutability', 'nonpayable')
-                    })
-            
-            contract_info[contract_name] = {
-                'constructor_params': constructor_params,
-                'functions': functions,
-                'abi': abi,
-                'bytecode': artifact.get('bytecode', ''),
-                'path': artifact.get('path', ''),
-                'has_constructor': len(constructor_params) > 0,
-                'function_count': len(functions)
-            }
-            total_contracts += 1
+        try:
+            self.validate_file_size(content)
+        except SecurityError as e:
+            return {"success": False, "error": f"Content validation failed: {e}"}
         
-        analysis_summary = {
-            'total_contracts': total_contracts,
-            'contracts_with_constructors': sum(1 for info in contract_info.values() if info['has_constructor']),
-            'total_functions': sum(info['function_count'] for info in contract_info.values()),
-            'contract_names': list(contract_info.keys())
-        }
+        if not must_exist:
+            validated_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            with open(validated_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            return {"success": False, "error": f"Error writing file: {e}"}
         
         return {
             "success": True,
-            "contracts": contract_info,
-            "total_contracts": total_contracts,
-            "analysis_summary": analysis_summary
-        }
-        
-    except Exception as e:
-        logger.error(f"Error analyzing contract artifacts: {e}")
-        return {
-            "success": False,
-            "error": str(e)
+            "file_path": file_path,
+            "absolute_path": str(validated_path),
+            "file_size": len(content.encode('utf-8'))
         }
 
 
-_project_manager = ProjectManager()
+_project_manager = ProjectManager(base_dir=Path.home() / "mcp_projects")
 def get_project_manager() -> ProjectManager:
     """Get global project manager"""
     return _project_manager

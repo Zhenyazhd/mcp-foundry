@@ -1,12 +1,3 @@
-"""
-Build Management Module
-
-Provides tools for:
-- Foundry build toolchain management
-- Solidity compiler version management via solc-select
-- Artifact caching and path/ABI normalization
-- Build process orchestration
-"""
 
 import subprocess
 import json
@@ -65,6 +56,35 @@ class CompilationResult:
 
 
 @dataclass
+class ScriptRunResult:
+    """Result of running a Foundry script"""
+    success: bool
+    return_code: int
+    stdout: str
+    stderr: str
+    rpc_url: str
+    broadcast: bool
+    transaction_type: str
+    script_target: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class TestResult:
+    """Result of running tests"""
+    success: bool
+    return_code: int
+    stdout: str
+    stderr: str
+    duration: float
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class ArtifactCache:
     """Artifact cache entry"""
     hash: str
@@ -82,7 +102,6 @@ class BuildManager:
         self.cache_dir = self.project_root / ".build_cache"
         self.cache_dir.mkdir(exist_ok=True)
         
-        # Toolchain detection patterns
         self.toolchain_patterns = {
             BuildToolchain.FOUNDRY: [
                 "foundry.toml",
@@ -97,7 +116,6 @@ class BuildManager:
         """Auto-detect build toolchain (Foundry only)"""
         logger.info("Detecting build toolchain...")
         
-        # Check for Foundry
         if self._check_toolchain_patterns(BuildToolchain.FOUNDRY):
             logger.info("Foundry toolchain detected")
             return BuildToolchain.FOUNDRY
@@ -114,7 +132,6 @@ class BuildManager:
             if (self.project_root / pattern).exists():
                 found_patterns += 1
         
-        # Require at least 2 patterns to confirm toolchain
         return found_patterns >= 2
     
     def get_solc_version(self) -> Optional[str]:
@@ -213,7 +230,6 @@ class BuildManager:
             with open(cache_file, 'r') as f:
                 cache_data = json.load(f)
             
-            # Check if cache is still valid (24 hours)
             if time.time() - cache_data['timestamp'] > 86400:
                 logger.info("Cache expired, removing")
                 cache_file.unlink()
@@ -224,6 +240,125 @@ class BuildManager:
         except Exception as e:
             logger.error(f"Error loading from cache: {e}")
             return None
+    
+    def run_script(
+        self,
+        script_path: str = "script/Deploy.s.sol",
+        rpc_url: str = "http://localhost:8545",
+        private_key: Optional[str] = None,
+        broadcast: bool = True,
+        transaction_type: str = "1559",
+        extra_args: Optional[List[str]] = None,
+    ) -> ScriptRunResult:
+        """
+        Run a Foundry script using `forge script`.
+        
+        Args:
+            script_path: Path to script file, relative to project root, e.g. "script/Deploy.s.sol"
+            rpc_url: RPC endpoint
+            private_key: Private key for signing txs (optional)
+            broadcast: Whether to add `--broadcast`
+            transaction_type: "legacy" or "1559"
+            extra_args: Extra CLI args to append (e.g. ["--verify", ...])
+        """
+        start_time = time.time()
+        
+        toolchain = self.detect_toolchain()
+        if toolchain != BuildToolchain.FOUNDRY:
+            return ScriptRunResult(
+                success=False,
+                return_code=1,
+                stdout="",
+                stderr=f"Unsupported toolchain for scripts: {toolchain.value}",
+                rpc_url=rpc_url,
+                broadcast=broadcast,
+                transaction_type=transaction_type,
+                script_target="",
+            )
+        
+        script_full_path = (self.project_root / script_path).resolve()
+        if not script_full_path.exists():
+            return ScriptRunResult(
+                success=False,
+                return_code=1,
+                stdout="",
+                stderr=f"Script not found: {script_path}",
+                rpc_url=rpc_url,
+                broadcast=broadcast,
+                transaction_type=transaction_type,
+                script_target="",
+            )
+        
+        script_target = str(script_full_path.relative_to(self.project_root))
+        contract_name = script_full_path.stem.replace(".s", "")
+        script_target_with_contract = f"{script_target}:{contract_name}"
+        
+        cmd = ["forge", "script", script_target_with_contract, "--rpc-url", rpc_url]
+        
+        if broadcast:
+            cmd.append("--broadcast")
+        
+        if private_key:
+            cmd.extend(["--private-key", private_key])
+        
+        if transaction_type == "legacy":
+            cmd.append("--legacy")
+        elif transaction_type == "1559":
+            cmd.append("--with-gas-price")
+        
+        if extra_args:
+            cmd.extend(extra_args)
+        
+        cmd.append("-vvv")
+        
+        try:
+            logger.info(f"Running script: {' '.join(cmd[:10])}... (truncated)")
+            
+            result = subprocess.run(
+                cmd,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            
+            duration = time.time() - start_time
+            logger.info(f"Script finished with code {result.returncode} in {duration:.2f}s")
+            
+            return ScriptRunResult(
+                success=result.returncode == 0,
+                return_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                rpc_url=rpc_url,
+                broadcast=broadcast,
+                transaction_type=transaction_type,
+                script_target=script_target_with_contract,
+            )
+        
+        except subprocess.TimeoutExpired:
+            return ScriptRunResult(
+                success=False,
+                return_code=124,
+                stdout="",
+                stderr="Script timeout (exceeded 5 minutes)",
+                rpc_url=rpc_url,
+                broadcast=broadcast,
+                transaction_type=transaction_type,
+                script_target=script_target_with_contract,
+            )
+        
+        except Exception as e:
+            return ScriptRunResult(
+                success=False,
+                return_code=1,
+                stdout="",
+                stderr=str(e),
+                rpc_url=rpc_url,
+                broadcast=broadcast,
+                transaction_type=transaction_type,
+                script_target=script_target_with_contract,
+            )
     
     def _save_to_cache(self, cache_key: str, result: CompilationResult, config: BuildConfig):
         """Save compilation result to cache"""
@@ -250,19 +385,12 @@ class BuildManager:
         """Find source files based on toolchain (Foundry only)"""
         source_files = []
         
-        if toolchain == BuildToolchain.FOUNDRY:
-            # Foundry typically uses src/ directory
-            src_dir = self.project_root / "src"
-            if src_dir.exists():
-                source_files.extend(src_dir.rglob("*.sol"))
-        
-        # Also check for any .sol files in project root (excluding out/ directory)
         for sol_file in self.project_root.rglob("*.sol"):
-            if "out/" not in str(sol_file.relative_to(self.project_root)):
+            relative_path = str(sol_file.relative_to(self.project_root))
+            if "out/" not in relative_path:
                 source_files.append(sol_file)
         
-        # Remove duplicates and sort
-        source_files = sorted(list(set(source_files)))
+        source_files = sorted(source_files)
         logger.info(f"Found {len(source_files)} source files")
         
         return source_files
@@ -278,11 +406,9 @@ class BuildManager:
         for item in abi:
             normalized_item = item.copy()
             
-            # Ensure consistent field ordering
             if 'type' in normalized_item:
                 normalized_item['type'] = normalized_item['type'].lower()
             
-            # Normalize function signatures
             if normalized_item.get('type') == 'function':
                 if 'inputs' in normalized_item:
                     normalized_item['inputs'] = sorted(
@@ -300,7 +426,6 @@ class BuildManager:
         start_time = time.time()
         
         try:
-            # Run forge build
             result = subprocess.run(
                 ["forge", "build"],
                 capture_output=True,
@@ -320,7 +445,6 @@ class BuildManager:
                     warnings=[]
                 )
             
-            # Parse artifacts from out/ directory
             artifacts = self._parse_foundry_artifacts()
             
             return CompilationResult(
@@ -358,7 +482,6 @@ class BuildManager:
                     artifact_data = json.load(f)
                 
                 if 'abi' in artifact_data and 'bytecode' in artifact_data:
-                    # Extract contract name from various possible locations
                     contract_name = self._extract_contract_name(artifact_file, artifact_data)
                     
                     artifact = {
@@ -378,51 +501,40 @@ class BuildManager:
     
     def _extract_contract_name(self, artifact_file: Path, artifact_data: Dict[str, Any]) -> str:
         """Extract contract name from Foundry artifact"""
-        # Method 1: Try to get from artifact_data.contractName (Hardhat style)
         if 'contractName' in artifact_data:
             return artifact_data['contractName']
         
-        # Method 2: Try to get from metadata.settings.compilationTarget (Foundry style)
         metadata = artifact_data.get('metadata', {})
         settings = metadata.get('settings', {})
         compilation_target = settings.get('compilationTarget', {})
         
         if compilation_target:
-            # compilationTarget is a dict like {"path/to/file.sol": "ContractName"}
             for file_path, contract_name in compilation_target.items():
                 if contract_name and contract_name != 'Unknown':
                     return contract_name
         
-        # Method 3: Extract from file path
-        # Foundry artifacts are in format: out/ContractName.sol/ContractName.json
         file_path_parts = artifact_file.parts
         if len(file_path_parts) >= 3:
-            # Get the directory name (ContractName.sol)
             dir_name = file_path_parts[-2]
             if dir_name.endswith('.sol'):
-                contract_name = dir_name[:-4]  # Remove .sol extension
+                contract_name = dir_name[:-4]
                 if contract_name and contract_name != 'Unknown':
                     return contract_name
         
-        # Method 4: Extract from filename
-        filename = artifact_file.stem  # Remove .json extension
+        filename = artifact_file.stem
         if filename and filename != 'Unknown':
             return filename
         
-        # Method 5: Try to extract from ABI (look for constructor)
         abi = artifact_data.get('abi', [])
         for item in abi:
             if item.get('type') == 'constructor':
-                # Try to find contract name from constructor inputs or other clues
                 pass
         
-        # Fallback: return filename or Unknown
         return artifact_file.stem if artifact_file.stem else 'Unknown'
     
     
     def compile(self, config: Optional[BuildConfig] = None) -> CompilationResult:
         """Main compilation method with caching"""
-        # Auto-detect toolchain if not provided
         if config is None:
             toolchain = self.detect_toolchain()
             solc_version = self.get_solc_version() or "0.8.19"
@@ -434,7 +546,6 @@ class BuildManager:
                 output_dir="out" if toolchain == BuildToolchain.FOUNDRY else "artifacts"
             )
         
-        # Find source files
         source_files = self.find_source_files(config.toolchain)
         
         if not source_files:
@@ -447,13 +558,11 @@ class BuildManager:
                 warnings=[]
             )
         
-        # Check cache
         cache_key = self._get_cache_key(config, source_files)
         cached_result = self._load_from_cache(cache_key)
         if cached_result:
             return cached_result
         
-        # Compile based on toolchain
         if config.toolchain == BuildToolchain.FOUNDRY:
             result = self.compile_foundry(config)
         else:
@@ -466,7 +575,6 @@ class BuildManager:
                 warnings=[]
             )
         
-        # Save to cache if successful
         if result.success:
             self._save_to_cache(cache_key, result, config)
         
@@ -492,53 +600,126 @@ class BuildManager:
             "size": total_size,
             "size_mb": round(total_size / 1024 / 1024, 2)
         }
+    
+    def run_tests(
+        self,
+        pattern: Optional[str] = None,
+        toolchain: Optional[BuildToolchain] = None,
+        extra_args: Optional[List[str]] = None
+    ) -> TestResult:
+        """
+        Run tests for the project.
+        
+        For Foundry:
+        - uses `forge test`
+        - optional `pattern` passed as `-m pattern` (to filter by test name)
+        - optional `extra_args` for additional flags (e.g., ["--ffi", "-vvv", "--match-path", "test/MyTest.t.sol"])
+        
+        Args:
+            pattern: Test name pattern to filter (passed as `-m pattern`)
+            toolchain: Build toolchain (auto-detected if not provided)
+            extra_args: Extra CLI args to append (e.g., ["--ffi", "-vvv", "--match-contract", "MyTest"])
+        """
+        start_time = time.time()
+        
+        # Auto-detect toolchain if not provided
+        if toolchain is None:
+            toolchain = self.detect_toolchain()
+        
+        if toolchain != BuildToolchain.FOUNDRY:
+            return TestResult(
+                success=False,
+                return_code=1,
+                stdout="",
+                stderr=f"Unsupported toolchain for tests: {toolchain.value}",
+                duration=0.0,
+            )
+        
+        cmd = ["forge", "test"]
+        
+        if pattern:
+            cmd.extend(["-m", pattern])
+        
+        if extra_args:
+            cmd.extend(extra_args)
+        
+        try:
+            logger.info(f"Running tests: {' '.join(cmd)}")
+            
+            result = subprocess.run(
+                cmd,
+                cwd=self.project_root,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            
+            duration = time.time() - start_time
+            
+            return TestResult(
+                success=result.returncode == 0,
+                return_code=result.returncode,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                duration=duration,
+            )
+        
+        except subprocess.TimeoutExpired:
+            duration = time.time() - start_time
+            return TestResult(
+                success=False,
+                return_code=124,
+                stdout="",
+                stderr="Tests timeout (exceeded 5 minutes)",
+                duration=duration,
+            )
+        
+        except Exception as e:
+            duration = time.time() - start_time
+            return TestResult(
+                success=False,
+                return_code=1,
+                stdout="",
+                stderr=str(e),
+                duration=duration,
+            )
 
 
-# Global build manager instance
-_build_manager = BuildManager()
+def detect_toolchain(project_root: str = ".") -> BuildToolchain:
+    """Detect build toolchain for a project directory"""
+    build_manager = BuildManager(project_root)
+    return build_manager.detect_toolchain()
 
 
-def get_build_manager() -> BuildManager:
-    """Get global build manager"""
-    return _build_manager
-
-
-# Convenience functions
-def detect_toolchain() -> BuildToolchain:
-    """Detect build toolchain"""
-    return _build_manager.detect_toolchain()
-
-
-def compile_project(config: Optional[BuildConfig] = None) -> CompilationResult:
+def compile_project(config: Optional[BuildConfig] = None, project_root: str = ".") -> CompilationResult:
     """Compile project with auto-detection"""
-    return _build_manager.compile(config)
+    build_manager = BuildManager(project_root)
+    return build_manager.compile(config)
 
 
-def get_solc_version() -> Optional[str]:
+def get_solc_version(project_root: str = ".") -> Optional[str]:
     """Get current solc version"""
-    return _build_manager.get_solc_version()
+    build_manager = BuildManager(project_root)
+    return build_manager.get_solc_version()
 
 
-def set_solc_version(version: str) -> bool:
+def set_solc_version(version: str, project_root: str = ".") -> bool:
     """Set solc version"""
-    return _build_manager.set_solc_version(version)
+    build_manager = BuildManager(project_root)
+    return build_manager.set_solc_version(version)
 
 
 if __name__ == "__main__":
-    # Example usage
     logging.basicConfig(level=logging.INFO)
     
     print("=== Build Manager Test ===")
     
-    # Detect toolchain
     toolchain = detect_toolchain()
     print(f"Detected toolchain: {toolchain.value}")
     
-    # Get solc version
     solc_version = get_solc_version()
     print(f"Current solc version: {solc_version}")
     
-    # Compile project
     result = compile_project()
     print(f"Compilation success: {result.success}")
     print(f"Artifacts: {len(result.artifacts)}")
@@ -547,6 +728,6 @@ if __name__ == "__main__":
     if result.errors:
         print(f"Errors: {result.errors}")
     
-    # Cache stats
-    cache_stats = _build_manager.get_cache_stats()
+    build_manager = BuildManager()
+    cache_stats = build_manager.get_cache_stats()
     print(f"Cache stats: {cache_stats}")
